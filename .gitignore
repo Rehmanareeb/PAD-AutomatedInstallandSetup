@@ -1,0 +1,11 @@
+# Ignore all files
+*
+
+# Don't ignore directories so we can re-include files within them
+!*/
+
+# Allow PowerShell scripts at any depth
+!**/*.ps1
+
+# Ensure the gitignore itself is tracked
+!/.gitignore
