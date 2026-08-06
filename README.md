@@ -174,8 +174,6 @@ The script exits `0` on success and `1` on failure.
 
 ### The underlying registration command
 
-Everything the script does at step 4 is a call to Microsoft's silent registration
-tool, installed with Power Automate at:
 
 ```
 %ProgramFiles(x86)%\Power Automate Desktop\PAD.MachineRegistration.Silent.exe
