@@ -1,0 +1,237 @@
+# Setup_PAD.ps1 — unattended Power Automate machine provisioning
+
+[Setup_PAD.ps1](Setup_PAD.ps1) takes a fresh Windows machine to "registered and
+visible in Power Automate" in one pass: it installs Power Automate for desktop
+and registers the machine to a Power Platform environment, with no interactive
+sign-in and without ever launching the Power Automate GUI.
+
+Authentication is by **Microsoft Entra app registration** — client ID, tenant ID
+and a client secret. That is the only mode the script supports.
+
+Before the first machine can be registered the tenant needs to be prepared once:
+an Azure app registration with Microsoft Flow Service permissions, and that app
+added as an application user in the target environment. Both are covered under
+[One-time tenant setup](#one-time-tenant-setup).
+
+---
+
+## What the script does
+
+1. **Preflight**
+   - Administrator rights.
+   - Rejects Windows Home editions — direct connectivity is not supported there.
+   - Probes outbound HTTPS to `login.microsoftonline.com`,
+     `gateway.prod.island.powerapps.com` and `go.microsoft.com`. A blocked
+     endpoint otherwise shows up much later as a generic "error connecting to the
+     Power Automate cloud services", so it is worth failing loudly up front.
+   - Checks `PAD_SECRET` is set, *before* the download, so a missing secret
+     fails in seconds rather than after a several-minute install.
+2. **Download** — pulls the installer from the Microsoft FWLink
+   (`linkid=2102613`) into `%TEMP%\pad-install`.
+3. **Silent install** — `Setup.Microsoft.PowerAutomate.exe -Silent -Install
+   -ACCEPTEULA`. Installs Power Automate for desktop, the machine-runtime app and
+   the browser extensions. `-ACCEPTEULA` is mandatory for unattended runs.
+
+   **Already installed?** Steps 2 and 3 are skipped entirely — no download, no
+   installer run — and the script goes straight to registration. Detection is the
+   presence of `PAD.MachineRegistration.Silent.exe` in the Power Automate install
+   folder; the version found is printed. Pass `-Reinstall` to install over the
+   top anyway. This makes the script safe to re-run on a machine that is already
+   built, e.g. to move it to a different environment.
+4. **Register** — runs `PAD.MachineRegistration.Silent.exe -register
+   -applicationid <app-id> -clientsecret -tenantid <tenant-id> …` (see
+   [the underlying registration command](#the-underlying-registration-command)).
+   This is what makes the machine appear in Power Automate: the runtime
+   authenticates *outbound* and creates the `flowmachine` record in Dataverse.
+   There is no agentless path.
+5. **Verify** — confirms the machine-runtime Windows service is running, and
+   starts it if not.
+
+The client secret is read from the `PAD_SECRET` environment variable and piped to
+the registration tool over **stdin** — never passed as a command-line argument,
+where it would be visible in the process list. `PAD_SECRET` is cleared after
+registration.
+
+> **Do not clone a VM after this script has run.** Microsoft's guidance is to
+> keep the base image clean — the machine identity and registration break on
+> clone. Run the script post-clone, on each machine.
+
+---
+
+## Prerequisites
+
+- Windows 10/11 **Pro, Enterprise or Education**, or Windows Server. Not Home.
+- Local Administrator on the machine.
+- A Power Platform environment, and its **environment ID** (GUID). Find it in the
+  Power Automate portal URL, or in
+  [admin.powerplatform.com](https://admin.powerplatform.com) → **Environments** →
+  select the environment → the ID is on the details pane.
+- The [one-time tenant setup](#one-time-tenant-setup) done: an Azure app
+  registration with admin-consented Microsoft Flow Service permissions, a client
+  secret for it, and that app added as an application user in the environment.
+- Appropriate Power Automate RPA licensing on the environment.
+- Outbound HTTPS (443) to `*.dynamics.com`, `*.servicebus.windows.net`,
+  `*.gateway.prod.island.powerapps.com` and `login.microsoftonline.com`.
+
+---
+
+## One-time tenant setup
+
+Done once per environment, before the first machine. Portal wording drifts, so
+treat the menu names as approximate.
+
+### 1. Azure app registration
+
+1. Go to [portal.azure.com](https://portal.azure.com) → **Microsoft Entra ID** →
+   **App registrations** → **New registration**.
+2. Name it (e.g. `pad-machine-registration`), leave it **single tenant**, and skip
+   the redirect URI. **Register**.
+3. On the **Overview** page copy and keep:
+   - **Application (client) ID**
+   - **Directory (tenant) ID**
+4. **API permissions** → **Add a permission** → **Microsoft Flow Service** →
+   **Delegated permissions**, and tick **all the Flow permissions plus the user
+   permission**:
+   - `Activity.Read.All`
+   - `Approvals.Manage.All`
+   - `Approvals.Read.All`
+   - `Flows.Manage.All`
+   - `Flows.Read.All`
+   - `User`
+
+   → **Add permissions**.
+5. **Grant admin consent for \<tenant\>** and confirm every row turns green.
+   Requires a Privileged Role Administrator or Global Administrator.
+6. **Certificates & secrets** → **New client secret** → set an expiry → **Add**.
+   Copy the secret **Value** immediately — it is shown only once. This is what
+   goes into `$env:PAD_SECRET`.
+
+Steps 3 and 6 are the only place the client ID, tenant ID and secret are
+visible. Record all three.
+
+### 2. Register the app in the Power Platform admin center
+
+An Entra app registration on its own is invisible to Dataverse. It needs an
+**application user** in the environment machines are registered into.
+
+1. Go to [admin.powerplatform.com](https://admin.powerplatform.com) →
+   **Environments** → select the target environment.
+2. **Settings** → **Users + permissions** → **Application users**.
+3. **+ New app user**.
+4. **+ Add an app** → search for the app registration by name or client ID →
+   select it → **Add**.
+5. Pick a **Business unit** (the root business unit is the normal choice).
+6. **Security roles** → **Edit** → assign **Desktop Flows Machine Owner**, plus
+   **Environment Maker** and **Basic User** if your roles do not already inherit
+   them.
+7. **Create**. The app user now appears in the Application users list.
+
+While in the admin center, note the environment GUID from the environment's
+details pane — that is `-EnvironmentId`. Also confirm the environment has the RPA
+capacity the machine will consume.
+
+That is the whole setup. There is no service account and no interactive sign-in:
+the app registration *is* the identity, so nothing has to be excluded from MFA.
+
+---
+
+## How to run
+
+Open PowerShell **as Administrator** in this folder. If scripts are blocked:
+
+```bash
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+Then:
+
+```bash
+$env:PAD_SECRET = '<client secret>'
+```
+
+```bash
+.\Setup_PAD.ps1 -EnvironmentId '<env-guid>' -ApplicationId '<app-id>' -TenantId '<tenant-id>' -MachineName 'CUA-UAT-01'
+```
+
+`-MachineName` is optional; it defaults to the computer name.
+
+### Parameters
+
+| Parameter | Notes |
+|---|---|
+| `-EnvironmentId` | **Required.** Power Platform environment GUID. |
+| `-ApplicationId` | **Required.** Application (client) ID of the app registration. |
+| `-TenantId` | **Required.** Directory (tenant) ID. |
+| `-MachineName` | Defaults to `$env:COMPUTERNAME`. |
+| `-MachineDescription` | Free text shown in the portal. Defaults to `CUA`. |
+| `-InstallerUrl` | Override the installer download link. |
+| `-WorkDir` | Download folder. Default `%TEMP%\pad-install`. |
+| `-SkipConnectivityCheck` | For proxies that block the probe but allow real traffic. |
+| `-Reinstall` | Install Power Automate again even if it is already present. Without it, an existing install is left alone and only the registration runs. |
+| `-Force` | Override an existing machine registration. **This breaks existing connections to the machine.** Does not trigger a reinstall. |
+
+The script exits `0` on success and `1` on failure.
+
+### The underlying registration command
+
+Everything the script does at step 4 is a call to Microsoft's silent registration
+tool, installed with Power Automate at:
+
+```
+%ProgramFiles(x86)%\Power Automate Desktop\PAD.MachineRegistration.Silent.exe
+```
+
+The command it builds is:
+
+```
+PAD.MachineRegistration.Silent.exe -register -applicationid <app-id> -clientsecret -tenantid <tenant-id> -environmentid <env-id> -machinename <machine-name> -machinedescription CUA
+```
+
+Note that `-clientsecret` takes **no value on the command line** — the tool reads
+the secret from stdin, which is why the script pipes `PAD_SECRET` in that way and
+why the secret never lands in the process list.
+
+`-force` is appended when the script is run with `-Force`. The script echoes the
+exact argument list it used (secret omitted) before running it, which is the
+first thing to check when a registration fails.
+
+### After a successful run
+
+The machine appears at **make.powerautomate.com → Machines**. One step has no
+documented API and must be done in the portal:
+
+> Machines → *your machine* → **Settings** → **Enable for computer use** → Save
+
+Readiness can be polled from Dataverse instead of the UI:
+
+```
+GET /api/data/v9.2/flowmachines?$filter=name eq 'CUA-UAT-01'
+    &$select=name,statuscode,lastheartbeatdate,agentversion
+```
+
+Ready when `statuscode = 1` (Active) with a recent `lastheartbeatdate`.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `This script must run as Administrator` | Elevate the PowerShell session. |
+| `Direct connectivity is not available on Windows … Home` | Unsupported edition. Use Pro/Enterprise/Server. |
+| `… :443 UNREACHABLE` warning | Proxy/firewall blocking the Power Automate endpoints. Fix the allow-list, or pass `-SkipConnectivityCheck` if only the probe is blocked. |
+| `No credential found. Set $env:PAD_SECRET …` | The variable is unset, or was set in a different shell/session than the one running the script. |
+| `Installer failed with exit code …` | Download corrupt, or another install/upgrade of Power Automate in progress. Re-run with `-Reinstall`. |
+| Registration fails | No application user for the app in that environment; Microsoft Flow Service permissions never admin-consented; expired or mistyped client secret; the app user lacks **Desktop Flows Machine Owner**; or a stale registration (re-run with `-Force`). |
+| Registration fails: already registered | The machine is bound to another environment. Re-run with `-Force` — this breaks existing connections to it. |
+| Machine registers but never goes Active | Machine-runtime service not running (the script tries to start it), or outbound connectivity dropped after registration. |
+
+## Security notes
+
+- The client secret is only ever in `PAD_SECRET` and on the registration tool's
+  stdin. It never appears in the command line, the console log, or the script's
+  output. `PAD_SECRET` is cleared after registering.
+- Give the application user the least role that works — **Desktop Flows Machine
+  Owner** is usually enough; System Administrator is not required.
+- Client secrets expire. Note the expiry set in step 6 and rotate before it
+  lapses, or new machine registrations will start failing.
