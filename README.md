@@ -51,7 +51,13 @@ added as an application user in the target environment. Both are covered under
    `-Register Yes` or `-Register No` to answer without prompting — unattended
    runs must do this, since there is nothing to answer the prompt.
 
-   On **1**, it runs `PAD.MachineRegistration.Silent.exe -register -applicationid
+   On **1**, it then asks for the details it needs — environment ID, tenant ID,
+   application ID, and the client secret if `PAD_SECRET` is unset (masked input).
+   Each is validated as a GUID on entry, and anything already passed on the
+   command line is used without asking. **Nothing is asked for on choice 2**, so
+   an install-and-extension run needs no parameters at all.
+
+   Then it runs `PAD.MachineRegistration.Silent.exe -register -applicationid
    <app-id> -clientsecret -tenantid <tenant-id> …` (see [the underlying
    registration command](#the-underlying-registration-command)), then confirms
    the machine-runtime Windows service is running and starts it if not. This is
@@ -187,14 +193,27 @@ Open PowerShell **as Administrator** in this folder. If scripts are blocked:
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-Then:
+Then, with no arguments — it asks whether to register, and only then for the
+details it needs:
+
+```bash
+.\Setup_PAD.ps1
+```
+
+To install and set the extension policy without registering at all:
+
+```bash
+.\Setup_PAD.ps1 -Register No
+```
+
+Unattended, answering everything up front:
 
 ```bash
 $env:PAD_SECRET = '<client secret>'
 ```
 
 ```bash
-.\Setup_PAD.ps1 -EnvironmentId '<env-guid>' -ApplicationId '<app-id>' -TenantId '<tenant-id>' -MachineName 'CUA-UAT-01'
+.\Setup_PAD.ps1 -Register Yes -EnvironmentId '<env-guid>' -ApplicationId '<app-id>' -TenantId '<tenant-id>' -MachineName 'CUA-UAT-01'
 ```
 
 `-MachineName` is optional; it defaults to the computer name.
@@ -203,9 +222,9 @@ $env:PAD_SECRET = '<client secret>'
 
 | Parameter | Notes |
 |---|---|
-| `-EnvironmentId` | **Required.** Power Platform environment GUID. |
-| `-ApplicationId` | **Required.** Application (client) ID of the app registration. |
-| `-TenantId` | **Required.** Directory (tenant) ID. |
+| `-EnvironmentId` | Power Platform environment GUID. Asked for if registering and not supplied. |
+| `-ApplicationId` | Application (client) ID of the app registration. Asked for if registering and not supplied. |
+| `-TenantId` | Directory (tenant) ID. Asked for if registering and not supplied. |
 | `-Register` | `Ask` (default, prompts), `Yes` (register without prompting), `No` (skip registration). Unattended runs must pass `Yes` or `No`. |
 | `-MachineName` | Defaults to `$env:COMPUTERNAME`. |
 | `-MachineDescription` | Free text shown in the portal. Defaults to `CUA`. |
@@ -267,7 +286,8 @@ Ready when `statuscode = 1` (Active) with a recent `lastheartbeatdate`.
 | `This script must run as Administrator` | Elevate the PowerShell session. |
 | `Direct connectivity is not available on Windows … Home` | Unsupported edition. Use Pro/Enterprise/Server. |
 | `… :443 UNREACHABLE` warning | Proxy/firewall blocking the Power Automate endpoints. Fix the allow-list, or pass `-SkipConnectivityCheck` if only the probe is blocked. |
-| `No credential found. Set $env:PAD_SECRET …` | The variable is unset, or was set in a different shell/session than the one running the script. |
+| `No client secret given …` | `PAD_SECRET` is unset and nothing was typed at the masked prompt. |
+| `No valid EnvironmentId given …` | Three malformed GUIDs entered at the prompt. Pass it as a parameter instead. |
 | `Installer failed with exit code …` | Download corrupt, or another install/upgrade of Power Automate in progress. Re-run with `-Reinstall`. |
 | Registration fails | No application user for the app in that environment; Microsoft Flow Service permissions never admin-consented; expired or mistyped client secret; the app user lacks **Desktop Flows Machine Owner**; or a stale registration (re-run with `-Force`). |
 | Registration fails: already registered | The machine is bound to another environment. Re-run with `-Force` — this breaks existing connections to it. |

@@ -26,9 +26,13 @@
   The app needs Microsoft Flow Service permissions with admin consent, and an
   application user in the target environment. See README.md.
 
-  Note that -clientsecret takes no value on the command line. The secret is
-  supplied through the PAD_SECRET environment variable and piped over stdin -
-  never placed on the command line, where it would be visible in the process list.
+  Note that -clientsecret takes no value on the command line. The secret comes
+  from the PAD_SECRET environment variable, or is asked for with masked input if
+  that is unset, and is piped over stdin - never placed on the command line,
+  where it would be visible in the process list.
+
+  Nothing about the environment, tenant or app registration is asked for unless
+  you choose to register. An install-and-extension run needs no parameters at all.
 
   IMPORTANT: never clone a VM after this script has run. The registration and
   machine identity will break. Keep the base image clean and run this post-clone
@@ -36,16 +40,27 @@
 
 .PARAMETER EnvironmentId
   The Power Platform environment GUID. Found in the Power Automate portal URL.
+  Asked for if registering and not supplied.
 
 .PARAMETER ApplicationId
   Application (client) ID of the Entra app registration.
+  Asked for if registering and not supplied.
 
 .PARAMETER TenantId
-  Directory (tenant) ID.
+  Directory (tenant) ID. Asked for if registering and not supplied.
 
 .EXAMPLE
+  # Interactive: choose whether to register, and be asked for the details.
+  .\Setup_PAD.ps1
+
+.EXAMPLE
+  # Install and Chrome extension only, no prompts, no registration details.
+  .\Setup_PAD.ps1 -Register No
+
+.EXAMPLE
+  # Unattended registration.
   $env:PAD_SECRET = '<client secret>'
-  .\Setup_PAD.ps1 `
+  .\Setup_PAD.ps1 -Register Yes `
       -EnvironmentId '20bbbb76-91c1-efde-bf32-8a5468336104' `
       -ApplicationId '<app client id>' `
       -TenantId      'edda99bb-bab6-4c4c-8aa1-4b99e8e09c1b' `
@@ -57,11 +72,12 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$EnvironmentId,
-
-    # Entra app registration.
-    [Parameter(Mandatory = $true)][string]$ApplicationId,
-    [Parameter(Mandatory = $true)][string]$TenantId,
+    # Registration details. Optional on the command line - they are asked for
+    # only if you choose to register, so an install-and-extension run needs none
+    # of them. Supplying them up front skips the prompts.
+    [string]$EnvironmentId,
+    [string]$ApplicationId,
+    [string]$TenantId,
 
     [string]$MachineName        = $env:COMPUTERNAME,
     [string]$MachineDescription = 'CUA',
@@ -156,8 +172,8 @@ function Confirm-Registration {
     if ($Register -eq 'No')  { Write-Info 'Registration: skipped (-Register No).'; return $false }
 
     Write-Step 'Connect this machine to Power Platform?'
-    Write-Info "Environment : $EnvironmentId"
     Write-Info "Machine name: $MachineName"
+    if ($EnvironmentId) { Write-Info "Environment : $EnvironmentId" }
     Write-Host ''
     Write-Host '    [1] Yes - register this machine now'
     Write-Host '    [2] No  - skip registration, continue to the Chrome extension'
@@ -176,13 +192,49 @@ function Confirm-Registration {
     throw 'No valid choice given. Re-run with -Register Yes or -Register No.'
 }
 
-function Get-PadSecret {
-    if (-not $env:PAD_SECRET) {
-        throw 'No credential found. Set $env:PAD_SECRET to the app registration client secret before running.'
+function Read-RequiredGuid {
+    <# Return $Current if it is a usable GUID, otherwise ask for one. #>
+    param([string]$Label, [string]$Current)
+
+    if ($Current) {
+        if ($Current -as [guid]) { return $Current }
+        throw "-$Label is not a valid GUID: '$Current'"
     }
-    Write-Info "App registration: $ApplicationId (tenant $TenantId)"
-    Write-Info 'Client secret loaded from PAD_SECRET (will be piped over stdin).'
-    return $env:PAD_SECRET
+    foreach ($attempt in 1..3) {
+        $value = (Read-Host "    $Label").Trim()
+        if ($value -as [guid]) { return $value }
+        Write-Host '    Not a valid GUID.' -ForegroundColor Yellow
+    }
+    throw "No valid $Label given. Pass it as a parameter instead."
+}
+
+function Read-RegistrationDetails {
+    <#
+      Asked for only once registration is chosen. Anything already supplied on
+      the command line is validated and kept, so unattended runs never prompt.
+    #>
+    Write-Step 'Registration details'
+    $script:EnvironmentId = Read-RequiredGuid 'EnvironmentId'  $EnvironmentId
+    $script:TenantId      = Read-RequiredGuid 'TenantId'       $TenantId
+    $script:ApplicationId = Read-RequiredGuid 'ApplicationId'  $ApplicationId
+    Write-Info "Environment: $script:EnvironmentId"
+    Write-Info "App registration: $script:ApplicationId (tenant $script:TenantId)"
+}
+
+function Get-PadSecret {
+    if ($env:PAD_SECRET) {
+        Write-Info 'Client secret loaded from PAD_SECRET (will be piped over stdin).'
+        return $env:PAD_SECRET
+    }
+    # Prompt rather than fail: by this point the user has already chosen to
+    # register. Masked input, and it never lands in the environment.
+    $secure = Read-Host '    Client secret' -AsSecureString
+    $plain  = [System.Net.NetworkCredential]::new('', $secure).Password
+    if (-not $plain) {
+        throw 'No client secret given. Set $env:PAD_SECRET or enter it when asked.'
+    }
+    Write-Info 'Client secret captured (will be piped over stdin).'
+    return $plain
 }
 
 # ------------------------------ install ------------------------------
@@ -360,9 +412,14 @@ try {
     Test-WindowsEdition
     Test-Connectivity
 
+    # Details and credential are collected BEFORE the download, so a typo or a
+    # missing secret fails in seconds rather than after a several-minute install.
     $doRegister = Confirm-Registration
-    # Fail on a missing credential BEFORE spending time on the download/install.
-    $cred = if ($doRegister) { Get-PadSecret } else { $null }
+    $cred = $null
+    if ($doRegister) {
+        Read-RegistrationDetails
+        $cred = Get-PadSecret
+    }
 
     Install-Pad
     Confirm-Install
@@ -399,11 +456,9 @@ REMINDER: do not clone this VM now that Power Automate is installed and register
 Power Automate is installed and the Chrome extension policy is in place.
 
 The machine was NOT registered, so it will not appear in Power Automate.
-Register it later with:
+Register it later with (it will ask for the environment, tenant and app IDs):
 
-    `$env:PAD_SECRET = '<client secret>'
-    .\Setup_PAD.ps1 -EnvironmentId '$EnvironmentId' -ApplicationId '$ApplicationId' ``
-        -TenantId '$TenantId' -MachineName '$MachineName' -Register Yes
+    .\Setup_PAD.ps1 -MachineName '$MachineName' -Register Yes
 
 Restart Chrome to pick up the extension policy. Verify at chrome://policy/
 "@ -ForegroundColor Green
