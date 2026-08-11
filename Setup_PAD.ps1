@@ -10,9 +10,12 @@
        credential present.
     2. Download and silently install Power Automate for desktop, including the
        machine-runtime app and browser extensions.
-    3. Register the machine to the environment. This is what makes it appear in
-       Power Automate; there is no agentless path and the PAD GUI is never launched.
-    4. Verify the machine-runtime service is running.
+    3. Register the machine to the environment, and verify the machine-runtime
+       service is running. This is what makes it appear in Power Automate; there
+       is no agentless path and the PAD GUI is never launched.
+       Optional - see -Register.
+    4. Force-install the Power Automate extension in Chrome via machine policy,
+       so it is enabled and the user cannot turn it off.
 
   Authentication is by Microsoft Entra app registration only:
 
@@ -72,6 +75,19 @@ param(
     # but traffic is actually allowed).
     [switch]$SkipConnectivityCheck,
 
+    # Whether to connect this machine to the environment.
+    #   Ask - prompt (default, interactive runs)
+    #   Yes - register without prompting (unattended provisioning)
+    #   No  - skip registration, do the install and Chrome extension only
+    [ValidateSet('Ask', 'Yes', 'No')]
+    [string]$Register = 'Ask',
+
+    # Microsoft Power Automate extension for Chrome (PAD v2.27 or later).
+    [string]$ChromeExtensionId = 'ljglajjnnkapghbckkcmodicjhacbfhk',
+
+    # Leave Chrome policy alone (e.g. the extension is already deployed by GPO).
+    [switch]$SkipChromeExtension,
+
     # Reinstall even if Power Automate is already present. Without this the
     # install step is skipped whenever the registration tool is found on disk.
     [switch]$Reinstall,
@@ -130,6 +146,36 @@ function Test-Connectivity {
     }
 }
 
+function Confirm-Registration {
+    <#
+      Returns $true to register the machine, $false to skip straight to the
+      Chrome extension step. -Register Yes/No answers this without prompting,
+      which is what unattended provisioning should pass.
+    #>
+    if ($Register -eq 'Yes') { Write-Info 'Registration: yes (-Register Yes).'; return $true }
+    if ($Register -eq 'No')  { Write-Info 'Registration: skipped (-Register No).'; return $false }
+
+    Write-Step 'Connect this machine to Power Platform?'
+    Write-Info "Environment : $EnvironmentId"
+    Write-Info "Machine name: $MachineName"
+    Write-Host ''
+    Write-Host '    [1] Yes - register this machine now'
+    Write-Host '    [2] No  - skip registration, continue to the Chrome extension'
+    Write-Host ''
+
+    # Read-Host against a redirected/empty stdin returns '' forever, so cap the
+    # attempts rather than spinning. Non-interactive callers should pass -Register.
+    foreach ($attempt in 1..3) {
+        $choice = (Read-Host '    Choice (1/2)').Trim()
+        switch ($choice) {
+            '1' { return $true }
+            '2' { return $false }
+            default { Write-Host '    Enter 1 or 2.' -ForegroundColor Yellow }
+        }
+    }
+    throw 'No valid choice given. Re-run with -Register Yes or -Register No.'
+}
+
 function Get-PadSecret {
     if (-not $env:PAD_SECRET) {
         throw 'No credential found. Set $env:PAD_SECRET to the app registration client secret before running.'
@@ -186,6 +232,45 @@ function Confirm-Install {
     }
     Write-Ok "Registration tool present (version $ver)"
     Write-Info "Path: $RegExe"
+}
+
+# -------------------------- chrome extension --------------------------
+
+function Enable-ChromeExtension {
+    <#
+      The installer ships the extension, but the user can still disable it.
+      Listing it in the ExtensionInstallForcelist machine policy makes Chrome
+      install it on next launch, enable it, and grey out the remove toggle.
+    #>
+    if ($SkipChromeExtension) {
+        Write-Step 'Chrome extension policy skipped'
+        return
+    }
+
+    Write-Step 'Force-installing the Power Automate Chrome extension'
+    $key = 'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist'
+    if (-not (Test-Path $key)) {
+        New-Item -Path $key -Force | Out-Null
+        Write-Info "Created policy key: $key"
+    }
+
+    # Entries are numbered values; an existing one may carry a ';<update-url>'
+    # suffix, so match on the ID prefix rather than the whole string.
+    $policy = Get-Item -Path $key
+    foreach ($name in $policy.GetValueNames()) {
+        if ($policy.GetValue($name) -like "$ChromeExtensionId*") {
+            Write-Ok "Already in the forcelist (value '$name') - no change."
+            return
+        }
+    }
+
+    $index = 1
+    while ($policy.GetValueNames() -contains "$index") { $index++ }
+    New-ItemProperty -Path $key -Name "$index" -Value $ChromeExtensionId `
+                     -PropertyType String -Force | Out-Null
+
+    Write-Ok "Added $index = $ChromeExtensionId"
+    Write-Info 'Chrome must be restarted to apply. Verify at chrome://policy/'
 }
 
 # ----------------------------- register ------------------------------
@@ -274,20 +359,26 @@ try {
     Assert-Admin
     Test-WindowsEdition
     Test-Connectivity
+
+    $doRegister = Confirm-Registration
     # Fail on a missing credential BEFORE spending time on the download/install.
-    $cred = Get-PadSecret
+    $cred = if ($doRegister) { Get-PadSecret } else { $null }
 
     Install-Pad
     Confirm-Install
 
-    Register-Machine -Credential $cred
-    $cred = $null
-    Remove-Item Env:\PAD_SECRET -ErrorAction SilentlyContinue
+    if ($doRegister) {
+        Register-Machine -Credential $cred
+        $cred = $null
+        Remove-Item Env:\PAD_SECRET -ErrorAction SilentlyContinue
+        Confirm-Runtime
+    }
 
-    Confirm-Runtime
+    Enable-ChromeExtension
 
     Write-Step 'Setup complete'
-    Write-Host @"
+    if ($doRegister) {
+        Write-Host @"
 Machine '$MachineName' is installed and registered, and should now appear at:
     make.powerautomate.com -> Machines
 
@@ -299,8 +390,24 @@ Poll readiness from the backend via the Dataverse flowmachine table:
         &`$select=name,statuscode,lastheartbeatdate,agentversion
     Ready when statuscode = 1 (Active) with a recent lastheartbeatdate.
 
+Restart Chrome to pick up the extension policy. Verify at chrome://policy/
+
 REMINDER: do not clone this VM now that Power Automate is installed and registered.
 "@ -ForegroundColor Green
+    } else {
+        Write-Host @"
+Power Automate is installed and the Chrome extension policy is in place.
+
+The machine was NOT registered, so it will not appear in Power Automate.
+Register it later with:
+
+    `$env:PAD_SECRET = '<client secret>'
+    .\Setup_PAD.ps1 -EnvironmentId '$EnvironmentId' -ApplicationId '$ApplicationId' ``
+        -TenantId '$TenantId' -MachineName '$MachineName' -Register Yes
+
+Restart Chrome to pick up the extension policy. Verify at chrome://policy/
+"@ -ForegroundColor Green
+    }
     exit 0
 }
 catch {

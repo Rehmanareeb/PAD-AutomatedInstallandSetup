@@ -38,14 +38,33 @@ added as an application user in the target environment. Both are covered under
    folder; the version found is printed. Pass `-Reinstall` to install over the
    top anyway. This makes the script safe to re-run on a machine that is already
    built, e.g. to move it to a different environment.
-4. **Register** — runs `PAD.MachineRegistration.Silent.exe -register
-   -applicationid <app-id> -clientsecret -tenantid <tenant-id> …` (see
-   [the underlying registration command](#the-underlying-registration-command)).
-   This is what makes the machine appear in Power Automate: the runtime
-   authenticates *outbound* and creates the `flowmachine` record in Dataverse.
-   There is no agentless path.
-5. **Verify** — confirms the machine-runtime Windows service is running, and
-   starts it if not.
+4. **Register — your choice.** The script asks whether to connect this machine to
+   the environment:
+
+   ```
+   [1] Yes - register this machine now
+   [2] No  - skip registration, continue to the Chrome extension
+   ```
+
+   Choosing **2** skips registration entirely and goes straight to the extension
+   step, so the machine is built but does not appear in Power Automate. Pass
+   `-Register Yes` or `-Register No` to answer without prompting — unattended
+   runs must do this, since there is nothing to answer the prompt.
+
+   On **1**, it runs `PAD.MachineRegistration.Silent.exe -register -applicationid
+   <app-id> -clientsecret -tenantid <tenant-id> …` (see [the underlying
+   registration command](#the-underlying-registration-command)), then confirms
+   the machine-runtime Windows service is running and starts it if not. This is
+   what makes the machine appear in Power Automate: the runtime authenticates
+   *outbound* and creates the `flowmachine` record in Dataverse. There is no
+   agentless path.
+5. **Chrome extension** — adds the Power Automate extension ID to the
+   `ExtensionInstallForcelist` machine policy under
+   `HKLM:\SOFTWARE\Policies\Google\Chrome`. The installer ships the extension,
+   but a user can disable it; the policy makes Chrome install it on next launch,
+   enable it, and grey out the remove toggle. Idempotent — an entry that is
+   already listed is left alone. **Chrome must be restarted** to pick it up;
+   verify at `chrome://policy/`. Skip with `-SkipChromeExtension`.
 
 The client secret is read from the `PAD_SECRET` environment variable and piped to
 the registration tool over **stdin** — never passed as a command-line argument,
@@ -81,6 +100,31 @@ Done once per environment, before the first machine. Portal wording drifts, so
 treat the menu names as approximate.
 
 ### 1. Azure app registration
+
+Steps 1–6 below are automated by [Create_PadApp.ps1](Create_PadApp.ps1), which
+does the same thing through **Azure CLI** and prints the tenant ID, client ID and
+secret at the end. It installs Azure CLI itself if `az` is missing, then signs
+you in interactively:
+
+```bash
+.\Create_PadApp.ps1 -DryRun
+```
+
+```bash
+.\Create_PadApp.ps1
+```
+
+`-DryRun` resolves the Flow Service permissions and prints every command without
+writing to the tenant — worth running first. Step 2 (the application user) is
+Dataverse, not Entra, and still has to be done by hand.
+
+> Azure CLI rather than the Microsoft Graph PowerShell module deliberately. Both
+> call the same Graph endpoints, but the Graph module signs in as *Microsoft
+> Graph Command Line Tools*, an app most tenants have not consented — it returns
+> 403 on the first read. Azure CLI signs in as its own first-party app, which is
+> normally pre-consented.
+
+The manual equivalent:
 
 1. Go to [portal.azure.com](https://portal.azure.com) → **Microsoft Entra ID** →
    **App registrations** → **New registration**.
@@ -162,11 +206,14 @@ $env:PAD_SECRET = '<client secret>'
 | `-EnvironmentId` | **Required.** Power Platform environment GUID. |
 | `-ApplicationId` | **Required.** Application (client) ID of the app registration. |
 | `-TenantId` | **Required.** Directory (tenant) ID. |
+| `-Register` | `Ask` (default, prompts), `Yes` (register without prompting), `No` (skip registration). Unattended runs must pass `Yes` or `No`. |
 | `-MachineName` | Defaults to `$env:COMPUTERNAME`. |
 | `-MachineDescription` | Free text shown in the portal. Defaults to `CUA`. |
 | `-InstallerUrl` | Override the installer download link. |
 | `-WorkDir` | Download folder. Default `%TEMP%\pad-install`. |
 | `-SkipConnectivityCheck` | For proxies that block the probe but allow real traffic. |
+| `-ChromeExtensionId` | Power Automate extension ID. Defaults to `ljglajjnnkapghbckkcmodicjhacbfhk`. |
+| `-SkipChromeExtension` | Leave Chrome policy alone, e.g. the extension is already deployed by GPO. |
 | `-Reinstall` | Install Power Automate again even if it is already present. Without it, an existing install is left alone and only the registration runs. |
 | `-Force` | Override an existing machine registration. **This breaks existing connections to the machine.** Does not trigger a reinstall. |
 
