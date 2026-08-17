@@ -8,10 +8,12 @@ sign-in and without ever launching the Power Automate GUI.
 Authentication is by **Microsoft Entra app registration** — client ID, tenant ID
 and a client secret. That is the only mode the script supports.
 
-Before the first machine can be registered the tenant needs to be prepared once:
-an Azure app registration with Microsoft Flow Service permissions, and that app
-added as an application user in the target environment. Both are covered under
-[One-time tenant setup](#one-time-tenant-setup).
+The tenant-side setup — an Azure app registration with Microsoft Flow Service
+permissions, and that app added as an application user in the target environment
+— is **performed by the client**, who provides the tenant ID, client ID, client
+secret and environment ID. See
+[One-time tenant setup](#one-time-tenant-setup--performed-by-the-client) for what
+that involves.
 
 ---
 
@@ -104,46 +106,33 @@ registration.
   Power Automate portal URL, or in
   [admin.powerplatform.com](https://admin.powerplatform.com) → **Environments** →
   select the environment → the ID is on the details pane.
-- The [one-time tenant setup](#one-time-tenant-setup) done: an Azure app
-  registration with admin-consented Microsoft Flow Service permissions, a client
-  secret for it, and that app added as an application user in the environment.
+- The [one-time tenant setup](#one-time-tenant-setup--performed-by-the-client)
+  done **by the client**, and the four values handed over: tenant ID, client ID,
+  client secret, environment ID.
 - Appropriate Power Automate RPA licensing on the environment.
 - Outbound HTTPS (443) to `*.dynamics.com`, `*.servicebus.windows.net`,
   `*.gateway.prod.island.powerapps.com` and `login.microsoftonline.com`.
 
 ---
 
-## One-time tenant setup
+## One-time tenant setup — performed by the client
 
-Done once per environment, before the first machine. Portal wording drifts, so
-treat the menu names as approximate.
+**This section is not run by this script.** The client does it once per
+environment and hands over four values, which are all `Setup_PAD_Final.ps1`
+needs:
+
+| Value | Where it comes from |
+|---|---|
+| **Tenant ID** | Entra app registration → Overview → Directory (tenant) ID |
+| **Client ID** | Entra app registration → Overview → Application (client) ID |
+| **Client secret** | Entra app registration → Certificates & secrets |
+| **Environment ID** | Power Platform admin center → the environment's details pane |
+
+The steps below are recorded so both sides agree on what has to exist before a
+machine can register. Portal wording drifts, so treat the menu names as
+approximate.
 
 ### 1. Azure app registration
-
-Steps 1–6 below are automated by [Create_PadApp.ps1](Create_PadApp.ps1), which
-does the same thing through **Azure CLI** and prints the tenant ID, client ID and
-secret at the end. It installs Azure CLI itself if `az` is missing, then signs
-you in interactively:
-
-```bash
-.\Create_PadApp.ps1 -DryRun
-```
-
-```bash
-.\Create_PadApp.ps1
-```
-
-`-DryRun` resolves the Flow Service permissions and prints every command without
-writing to the tenant — worth running first. Step 2 (the application user) is
-Dataverse, not Entra, and still has to be done by hand.
-
-> Azure CLI rather than the Microsoft Graph PowerShell module deliberately. Both
-> call the same Graph endpoints, but the Graph module signs in as *Microsoft
-> Graph Command Line Tools*, an app most tenants have not consented — it returns
-> 403 on the first read. Azure CLI signs in as its own first-party app, which is
-> normally pre-consented.
-
-The manual equivalent:
 
 1. Go to [portal.azure.com](https://portal.azure.com) → **Microsoft Entra ID** →
    **App registrations** → **New registration**.
