@@ -7,5 +7,5 @@
 # Track only these
 !/.gitignore
 !/README.md
-!/Setup_PAD.ps1
+!/Setup_PAD_Final.ps1
 !/Create_PadApp.ps1

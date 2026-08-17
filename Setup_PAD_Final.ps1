@@ -14,7 +14,7 @@
        service is running. This is what makes it appear in Power Automate; there
        is no agentless path and the PAD GUI is never launched.
        Optional - see -Register.
-    4. Force-install the Power Automate extension in Chrome via machine policy,
+    4. Force-install the Power Automate extension in Chrome and Edge via machine policy,
        so it is enabled and the user cannot turn it off.
 
   Authentication is by Microsoft Entra app registration only:
@@ -51,16 +51,16 @@
 
 .EXAMPLE
   # Interactive: choose whether to register, and be asked for the details.
-  .\Setup_PAD.ps1
+  .\Setup_PAD_Final.ps1
 
 .EXAMPLE
-  # Install and Chrome extension only, no prompts, no registration details.
-  .\Setup_PAD.ps1 -Register No
+  # Install and browser extensions only, no prompts, no registration details.
+  .\Setup_PAD_Final.ps1 -Register No
 
 .EXAMPLE
   # Unattended registration.
   $env:PAD_SECRET = '<client secret>'
-  .\Setup_PAD.ps1 -Register Yes `
+  .\Setup_PAD_Final.ps1 -Register Yes `
       -EnvironmentId '20bbbb76-91c1-efde-bf32-8a5468336104' `
       -ApplicationId '<app client id>' `
       -TenantId      'edda99bb-bab6-4c4c-8aa1-4b99e8e09c1b' `
@@ -94,15 +94,19 @@ param(
     # Whether to connect this machine to the environment.
     #   Ask - prompt (default, interactive runs)
     #   Yes - register without prompting (unattended provisioning)
-    #   No  - skip registration, do the install and Chrome extension only
+    #   No  - skip registration, do the install and browser extensions only
     [ValidateSet('Ask', 'Yes', 'No')]
     [string]$Register = 'Ask',
 
-    # Microsoft Power Automate extension for Chrome (PAD v2.27 or later).
+    # Microsoft Power Automate extension IDs, PAD v2.27 or later.
+    # Legacy (v2.26 or earlier) are gjgfobnenmnljakmhboildkafdkicala for Chrome
+    # and njjljiblognghfjfpcdpdbpbfcmhgafg for Edge.
     [string]$ChromeExtensionId = 'ljglajjnnkapghbckkcmodicjhacbfhk',
+    [string]$EdgeExtensionId   = 'kagpabjoboikccfdghpdlaaopmgpgfdc',
 
-    # Leave Chrome policy alone (e.g. the extension is already deployed by GPO).
+    # Leave browser policy alone (e.g. already deployed by GPO).
     [switch]$SkipChromeExtension,
+    [switch]$SkipEdgeExtension,
 
     # Reinstall even if Power Automate is already present. Without this the
     # install step is skipped whenever the registration tool is found on disk.
@@ -165,7 +169,7 @@ function Test-Connectivity {
 function Confirm-Registration {
     <#
       Returns $true to register the machine, $false to skip straight to the
-      Chrome extension step. -Register Yes/No answers this without prompting,
+      browser extension step. -Register Yes/No answers this without prompting,
       which is what unattended provisioning should pass.
     #>
     if ($Register -eq 'Yes') { Write-Info 'Registration: yes (-Register Yes).'; return $true }
@@ -176,7 +180,7 @@ function Confirm-Registration {
     if ($EnvironmentId) { Write-Info "Environment : $EnvironmentId" }
     Write-Host ''
     Write-Host '    [1] Yes - register this machine now'
-    Write-Host '    [2] No  - skip registration, continue to the Chrome extension'
+    Write-Host '    [2] No  - skip registration, continue to the browser extensions'
     Write-Host ''
 
     # Read-Host against a redirected/empty stdin returns '' forever, so cap the
@@ -286,43 +290,70 @@ function Confirm-Install {
     Write-Info "Path: $RegExe"
 }
 
-# -------------------------- chrome extension --------------------------
+# ------------------------- browser extensions -------------------------
 
-function Enable-ChromeExtension {
+function Enable-BrowserExtension {
     <#
-      The installer ships the extension, but the user can still disable it.
-      Listing it in the ExtensionInstallForcelist machine policy makes Chrome
-      install it on next launch, enable it, and grey out the remove toggle.
+      The installer ships the extension, but a user can still disable it.
+      Listing it in the browser's ExtensionInstallForcelist machine policy makes
+      the browser install it on next launch, enable it, and grey out the remove
+      toggle. Edge is Chromium, so the policy works identically - only the key
+      and the extension ID differ.
     #>
-    if ($SkipChromeExtension) {
-        Write-Step 'Chrome extension policy skipped'
-        return
-    }
+    param(
+        [string]$Browser,
+        [string]$PolicyKey,
+        [string]$ExtensionId,
+        [string]$UpdateUrl
+    )
 
-    Write-Step 'Force-installing the Power Automate Chrome extension'
-    $key = 'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist'
-    if (-not (Test-Path $key)) {
-        New-Item -Path $key -Force | Out-Null
-        Write-Info "Created policy key: $key"
+    Write-Step "Force-installing the Power Automate extension in $Browser"
+    if (-not (Test-Path $PolicyKey)) {
+        New-Item -Path $PolicyKey -Force | Out-Null
+        Write-Info "Created policy key: $PolicyKey"
     }
 
     # Entries are numbered values; an existing one may carry a ';<update-url>'
     # suffix, so match on the ID prefix rather than the whole string.
-    $policy = Get-Item -Path $key
+    $policy = Get-Item -Path $PolicyKey
     foreach ($name in $policy.GetValueNames()) {
-        if ($policy.GetValue($name) -like "$ChromeExtensionId*") {
+        if ($policy.GetValue($name) -like "$ExtensionId*") {
             Write-Ok "Already in the forcelist (value '$name') - no change."
             return
         }
     }
 
+    $entry = if ($UpdateUrl) { "$ExtensionId;$UpdateUrl" } else { $ExtensionId }
     $index = 1
     while ($policy.GetValueNames() -contains "$index") { $index++ }
-    New-ItemProperty -Path $key -Name "$index" -Value $ChromeExtensionId `
+    New-ItemProperty -Path $PolicyKey -Name "$index" -Value $entry `
                      -PropertyType String -Force | Out-Null
 
-    Write-Ok "Added $index = $ChromeExtensionId"
-    Write-Info 'Chrome must be restarted to apply. Verify at chrome://policy/'
+    Write-Ok "Added $index = $entry"
+    Write-Info "$Browser must be restarted to apply."
+}
+
+function Enable-BrowserExtensions {
+    if ($SkipChromeExtension) {
+        Write-Step 'Chrome extension policy skipped'
+    } else {
+        Enable-BrowserExtension -Browser 'Chrome' `
+            -PolicyKey   'HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist' `
+            -ExtensionId $ChromeExtensionId
+        Write-Info 'Verify at chrome://policy/'
+    }
+
+    if ($SkipEdgeExtension) {
+        Write-Step 'Edge extension policy skipped'
+    } else {
+        # Edge defaults to its own add-ons store, but state it explicitly so the
+        # entry cannot be resolved against the Chrome Web Store by mistake.
+        Enable-BrowserExtension -Browser 'Edge' `
+            -PolicyKey   'HKLM:\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist' `
+            -ExtensionId $EdgeExtensionId `
+            -UpdateUrl   'https://edge.microsoft.com/extensionwebstore/api/v1/crx'
+        Write-Info 'Verify at edge://policy/'
+    }
 }
 
 # ----------------------------- register ------------------------------
@@ -431,7 +462,7 @@ try {
         Confirm-Runtime
     }
 
-    Enable-ChromeExtension
+    Enable-BrowserExtensions
 
     Write-Step 'Setup complete'
     if ($doRegister) {
@@ -447,20 +478,22 @@ Poll readiness from the backend via the Dataverse flowmachine table:
         &`$select=name,statuscode,lastheartbeatdate,agentversion
     Ready when statuscode = 1 (Active) with a recent lastheartbeatdate.
 
-Restart Chrome to pick up the extension policy. Verify at chrome://policy/
+Restart Chrome and Edge to pick up the extension policy.
+Verify at chrome://policy/ and edge://policy/
 
 REMINDER: do not clone this VM now that Power Automate is installed and registered.
 "@ -ForegroundColor Green
     } else {
         Write-Host @"
-Power Automate is installed and the Chrome extension policy is in place.
+Power Automate is installed and the browser extension policies are in place.
 
 The machine was NOT registered, so it will not appear in Power Automate.
 Register it later with (it will ask for the environment, tenant and app IDs):
 
-    .\Setup_PAD.ps1 -MachineName '$MachineName' -Register Yes
+    .\Setup_PAD_Final.ps1 -MachineName '$MachineName' -Register Yes
 
-Restart Chrome to pick up the extension policy. Verify at chrome://policy/
+Restart Chrome and Edge to pick up the extension policy.
+Verify at chrome://policy/ and edge://policy/
 "@ -ForegroundColor Green
     }
     exit 0

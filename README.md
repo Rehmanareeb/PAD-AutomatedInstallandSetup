@@ -1,6 +1,6 @@
-# Setup_PAD.ps1 — unattended Power Automate machine provisioning
+# Setup_PAD_Final.ps1 — unattended Power Automate machine provisioning
 
-[Setup_PAD.ps1](Setup_PAD.ps1) takes a fresh Windows machine to "registered and
+[Setup_PAD_Final.ps1](Setup_PAD_Final.ps1) takes a fresh Windows machine to "registered and
 visible in Power Automate" in one pass: it installs Power Automate for desktop
 and registers the machine to a Power Platform environment, with no interactive
 sign-in and without ever launching the Power Automate GUI.
@@ -43,7 +43,7 @@ added as an application user in the target environment. Both are covered under
 
    ```
    [1] Yes - register this machine now
-   [2] No  - skip registration, continue to the Chrome extension
+   [2] No  - skip registration, continue to the browser extensions
    ```
 
    Choosing **2** skips registration entirely and goes straight to the extension
@@ -64,13 +64,26 @@ added as an application user in the target environment. Both are covered under
    what makes the machine appear in Power Automate: the runtime authenticates
    *outbound* and creates the `flowmachine` record in Dataverse. There is no
    agentless path.
-5. **Chrome extension** — adds the Power Automate extension ID to the
-   `ExtensionInstallForcelist` machine policy under
-   `HKLM:\SOFTWARE\Policies\Google\Chrome`. The installer ships the extension,
-   but a user can disable it; the policy makes Chrome install it on next launch,
-   enable it, and grey out the remove toggle. Idempotent — an entry that is
-   already listed is left alone. **Chrome must be restarted** to pick it up;
-   verify at `chrome://policy/`. Skip with `-SkipChromeExtension`.
+5. **Browser extensions** — adds the Power Automate extension ID to the
+   `ExtensionInstallForcelist` machine policy for both browsers:
+
+   | Browser | Policy key | Extension ID (v2.27+) |
+   |---|---|---|
+   | Chrome | `HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist` | `ljglajjnnkapghbckkcmodicjhacbfhk` |
+   | Edge | `HKLM:\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist` | `kagpabjoboikccfdghpdlaaopmgpgfdc` |
+
+   The installer ships the extension, but a user can disable it; the policy makes
+   the browser install it on next launch, enable it, and grey out the remove
+   toggle. Edge is Chromium, so the mechanism is identical — only the key and ID
+   differ, and the Edge entry carries an explicit add-ons-store update URL.
+   Idempotent — an entry already listed is left alone, and unrelated entries are
+   never overwritten. **Both browsers must be restarted** to pick it up; verify
+   at `chrome://policy/` and `edge://policy/`. Skip with `-SkipChromeExtension`
+   / `-SkipEdgeExtension`.
+
+   > For PAD v2.26 or earlier the legacy IDs apply instead:
+   > `gjgfobnenmnljakmhboildkafdkicala` (Chrome),
+   > `njjljiblognghfjfpcdpdbpbfcmhgafg` (Edge).
 
 The client secret is read from the `PAD_SECRET` environment variable and piped to
 the registration tool over **stdin** — never passed as a command-line argument,
@@ -197,13 +210,13 @@ Then, with no arguments — it asks whether to register, and only then for the
 details it needs:
 
 ```bash
-.\Setup_PAD.ps1
+.\Setup_PAD_Final.ps1
 ```
 
 To install and set the extension policy without registering at all:
 
 ```bash
-.\Setup_PAD.ps1 -Register No
+.\Setup_PAD_Final.ps1 -Register No
 ```
 
 Unattended, answering everything up front:
@@ -213,7 +226,7 @@ $env:PAD_SECRET = '<client secret>'
 ```
 
 ```bash
-.\Setup_PAD.ps1 -Register Yes -EnvironmentId '<env-guid>' -ApplicationId '<app-id>' -TenantId '<tenant-id>' -MachineName 'CUA-UAT-01'
+.\Setup_PAD_Final.ps1 -Register Yes -EnvironmentId '<env-guid>' -ApplicationId '<app-id>' -TenantId '<tenant-id>' -MachineName 'CUA-UAT-01'
 ```
 
 `-MachineName` is optional; it defaults to the computer name.
@@ -231,8 +244,10 @@ $env:PAD_SECRET = '<client secret>'
 | `-InstallerUrl` | Override the installer download link. |
 | `-WorkDir` | Download folder. Default `%TEMP%\pad-install`. |
 | `-SkipConnectivityCheck` | For proxies that block the probe but allow real traffic. |
-| `-ChromeExtensionId` | Power Automate extension ID. Defaults to `ljglajjnnkapghbckkcmodicjhacbfhk`. |
+| `-ChromeExtensionId` | Chrome extension ID. Defaults to `ljglajjnnkapghbckkcmodicjhacbfhk`. |
+| `-EdgeExtensionId` | Edge extension ID. Defaults to `kagpabjoboikccfdghpdlaaopmgpgfdc`. |
 | `-SkipChromeExtension` | Leave Chrome policy alone, e.g. the extension is already deployed by GPO. |
+| `-SkipEdgeExtension` | Leave Edge policy alone. |
 | `-Reinstall` | Install Power Automate again even if it is already present. Without it, an existing install is left alone and only the registration runs. |
 | `-Force` | Override an existing machine registration. **This breaks existing connections to the machine.** Does not trigger a reinstall. |
 
