@@ -14,7 +14,8 @@
        service is running. This is what makes it appear in Power Automate; there
        is no agentless path and the PAD GUI is never launched.
        Optional - see -Register.
-    4. Force-install the Power Automate extension in Chrome and Edge via machine policy,
+    4. Optionally enable the machine for computer use - see -EnableComputerUse.
+    5. Force-install the Power Automate extension in Chrome and Edge via machine policy,
        so it is enabled and the user cannot turn it off.
 
   Authentication is by Microsoft Entra app registration only:
@@ -49,6 +50,18 @@
 .PARAMETER TenantId
   Directory (tenant) ID. Asked for if registering and not supplied.
 
+.PARAMETER EnableComputerUse
+  After registering, enable the machine for computer use, which otherwise has to
+  be toggled by hand in the portal. This is the usagetype column on the machine's
+  GROUP (flowmachinegroups), set over the Dataverse Web API - so it applies to
+  every machine in that group. The column is not in Microsoft's published schema
+  reference, so the step fails soft: a failure warns and prints the manual
+  fallback, and never fails the run.
+
+.PARAMETER OrgUrl
+  Dataverse org URL, e.g. https://orgc0ee9ebb.crm.dynamics.com
+  Required only with -EnableComputerUse. Asked for if not supplied.
+
 .EXAMPLE
   # Interactive: choose whether to register, and be asked for the details.
   .\Setup_PAD_Final.ps1
@@ -65,6 +78,15 @@
       -ApplicationId '<app client id>' `
       -TenantId      'edda99bb-bab6-4c4c-8aa1-4b99e8e09c1b' `
       -MachineName   'CUA-UAT-01'
+
+.EXAMPLE
+  # Register and enable for computer use, no portal interaction at all.
+  $env:PAD_SECRET = '<client secret>'
+  .\Setup_PAD_Final.ps1 -Register Yes -EnableComputerUse `
+      -OrgUrl        'https://orgc0ee9ebb.crm.dynamics.com' `
+      -EnvironmentId '20bbbb76-91c1-efde-bf32-8a5468336104' `
+      -ApplicationId '<app client id>' `
+      -TenantId      'edda99bb-bab6-4c4c-8aa1-4b99e8e09c1b'
 
 .OUTPUTS
   Exit code 0 on success, 1 on failure.
@@ -107,6 +129,13 @@ param(
     # Leave browser policy alone (e.g. already deployed by GPO).
     [switch]$SkipChromeExtension,
     [switch]$SkipEdgeExtension,
+
+    # Enable the machine for computer use after registration.
+    [switch]$EnableComputerUse,
+
+    # Dataverse org URL, e.g. https://orgc0ee9ebb.crm.dynamics.com
+    # Required only when -EnableComputerUse is specified.
+    [string]$OrgUrl,
 
     # Reinstall even if Power Automate is already present. Without this the
     # install step is skipped whenever the registration tool is found on disk.
@@ -212,6 +241,26 @@ function Read-RequiredGuid {
     throw "No valid $Label given. Pass it as a parameter instead."
 }
 
+function Read-RequiredOrgUrl {
+    <# Same shape as Read-RequiredGuid, for the Dataverse org URL. #>
+    param([string]$Label, [string]$Current)
+
+    $isOrgUrl = {
+        param($v)
+        ($v -as [uri]) -and ([uri]$v).Scheme -eq 'https' -and ([uri]$v).Host
+    }
+    if ($Current) {
+        if (& $isOrgUrl $Current) { return $Current.TrimEnd('/') }
+        throw "-$Label is not a valid https URL: '$Current'"
+    }
+    foreach ($attempt in 1..3) {
+        $value = (Read-Host "    $Label (e.g. https://orgc0ee9ebb.crm.dynamics.com)").Trim()
+        if (& $isOrgUrl $value) { return $value.TrimEnd('/') }
+        Write-Host '    Not a valid https URL.' -ForegroundColor Yellow
+    }
+    throw "No valid $Label given. Pass it as a parameter instead."
+}
+
 function Read-RegistrationDetails {
     <#
       Asked for only once registration is chosen. Anything already supplied on
@@ -223,6 +272,13 @@ function Read-RegistrationDetails {
     $script:ApplicationId = Read-RequiredGuid 'ApplicationId'  $ApplicationId
     Write-Info "Environment: $script:EnvironmentId"
     Write-Info "App registration: $script:ApplicationId (tenant $script:TenantId)"
+
+    # Asked for here too, so a missing org URL fails before the install rather
+    # than after registration has already succeeded.
+    if ($EnableComputerUse) {
+        $script:OrgUrl = Read-RequiredOrgUrl 'OrgUrl' $OrgUrl
+        Write-Info "Dataverse org: $script:OrgUrl"
+    }
 }
 
 function Get-PadSecret {
@@ -436,6 +492,118 @@ function Confirm-Runtime {
     }
 }
 
+# --------------------------- computer use ----------------------------
+
+function Get-DataverseToken {
+    <# Client credentials for the same service principal used to register. #>
+    param([string]$Org, [string]$Tenant, [string]$AppId, [string]$Secret)
+
+    $body = @{
+        grant_type    = 'client_credentials'
+        client_id     = $AppId
+        client_secret = $Secret      # POST body, never the URL or command line
+        scope         = "$Org/.default"
+    }
+    $token = Invoke-RestMethod -Method Post -Body $body `
+        -Uri "https://login.microsoftonline.com/$Tenant/oauth2/v2.0/token"
+    if (-not $token.access_token) { throw 'Token endpoint returned no access_token.' }
+    return $token.access_token
+}
+
+function Invoke-Dataverse {
+    param([string]$Method, [string]$Uri, $Body, [string]$Token)
+
+    $headers = @{
+        Authorization    = "Bearer $Token"
+        Accept           = 'application/json'
+        'OData-MaxVersion' = '4.0'
+        'OData-Version'    = '4.0'
+    }
+    if ($Method -eq 'Patch') {
+        # Update-only: without If-Match, Dataverse would upsert a new row.
+        $headers['If-Match'] = '*'
+    }
+    # Not $args - that is an automatic variable.
+    $call = @{ Method = $Method; Uri = $Uri; Headers = $headers }
+    if ($Body) {
+        $call['Body']        = ($Body | ConvertTo-Json -Compress)
+        $call['ContentType'] = 'application/json'
+    }
+    return Invoke-RestMethod @call
+}
+
+function Enable-ComputerUse {
+    <#
+      "Enable for computer use" is not a machine setting - it is the usagetype
+      column on the machine's GROUP (flowmachinegroups): 1 = computer use,
+      0 = default desktop flows.
+
+      usagetype is absent from Microsoft's published schema reference. It works
+      today over the supported Dataverse Web API, but treat it as undocumented -
+      hence fail-soft everywhere here, with the portal toggle as the fallback.
+    #>
+    param(
+        [string]$Org,
+        [string]$Tenant,
+        [string]$AppId,
+        [string]$Secret,
+        [string]$Machine
+    )
+
+    Write-Step "Enabling '$Machine' for computer use"
+    $api = "$Org/api/data/v9.2"
+    $token = Get-DataverseToken -Org $Org -Tenant $Tenant -AppId $AppId -Secret $Secret
+    Write-Info "Authenticated to $Org"
+
+    # 1. Find the machine and the group it belongs to.
+    $filter = "name eq '$($Machine -replace "'", "''")'"
+    $query  = "$api/flowmachines?`$filter=$([uri]::EscapeDataString($filter))" +
+              '&$select=name,statuscode,lastheartbeatdate,_flowmachinegroupid_value'
+    # $machineRow, not $machine - PowerShell variables are case-insensitive, so
+    # $machine would clobber the $Machine parameter.
+    $machineRow = (Invoke-Dataverse -Method Get -Uri $query -Token $token).value | Select-Object -First 1
+
+    if (-not $machineRow) {
+        Write-Warning "No machine named '$Machine' found in this environment - cannot enable computer use."
+        return $false
+    }
+    Write-Info ("Machine found (statuscode {0}, last heartbeat {1})" -f
+                $machineRow.statuscode, $machineRow.lastheartbeatdate)
+
+    $groupId = $machineRow._flowmachinegroupid_value
+    if (-not $groupId) {
+        Write-Warning "Machine '$Machine' has no machine group assigned. The computer-use flag lives on the group, so there is nothing to set."
+        return $false
+    }
+
+    # 2. Read the group. Already enabled means no PATCH at all.
+    $group = Invoke-Dataverse -Method Get -Token $token `
+        -Uri "$api/flowmachinegroups($groupId)?`$select=name,usagetype"
+    Write-Info "Group: $($group.name) [$groupId], usagetype = $($group.usagetype)"
+
+    if ($group.usagetype -eq 1) {
+        Write-Ok 'Already enabled for computer use - no change made.'
+        return $true
+    }
+
+    # 3. Set only usagetype. The portal also sends statecode/statuscode/
+    #    preferredqueuingtype/groupmetadata; including those risks overwriting
+    #    settings changed elsewhere.
+    Invoke-Dataverse -Method Patch -Token $token `
+        -Uri "$api/flowmachinegroups($groupId)" -Body @{ usagetype = 1 } | Out-Null
+
+    # 4. Confirm it took, rather than trusting the 204.
+    $after = Invoke-Dataverse -Method Get -Token $token `
+        -Uri "$api/flowmachinegroups($groupId)?`$select=name,usagetype"
+    if ($after.usagetype -ne 1) {
+        throw "PATCH accepted but usagetype is still $($after.usagetype)."
+    }
+
+    Write-Ok "Enabled for computer use (usagetype = 1)."
+    Write-Warning "This applies to EVERY machine in group '$($group.name)', not just $Machine."
+    return $true
+}
+
 # ------------------------------- main -------------------------------
 try {
     Write-Step 'Preflight'
@@ -455,24 +623,63 @@ try {
     Install-Pad
     Confirm-Install
 
+    # $null = not attempted, $true/$false = attempted with that outcome.
+    $computerUse = $null
     if ($doRegister) {
         Register-Machine -Credential $cred
+        Confirm-Runtime
+
+        if ($EnableComputerUse) {
+            # Undocumented column: never let it fail the run. Registration has
+            # already succeeded by this point and the portal toggle still works.
+            try {
+                $computerUse = Enable-ComputerUse -Org $OrgUrl -Tenant $TenantId `
+                    -AppId $ApplicationId -Secret $cred -Machine $MachineName
+            }
+            catch {
+                $computerUse = $false
+                Write-Warning $_.Exception.Message
+            }
+            if (-not $computerUse) {
+                Write-Host @"
+Could not enable computer use automatically.
+Enable it manually: Power Automate > Machines > $MachineName > Settings >
+Enable for computer use.
+"@ -ForegroundColor Yellow
+            }
+        }
+
+        # Held until here because the computer-use step needs the same secret.
         $cred = $null
         Remove-Item Env:\PAD_SECRET -ErrorAction SilentlyContinue
-        Confirm-Runtime
     }
 
     Enable-BrowserExtensions
 
     Write-Step 'Setup complete'
     if ($doRegister) {
+        $computerUseLine = if ($computerUse) {
+@"
+It is ENABLED FOR COMPUTER USE and ready to use.
+    (usagetype = 1 on its machine group - applies to every machine in that group.)
+"@
+        } elseif ($null -ne $computerUse) {
+@"
+COMPUTER USE IS NOT ENABLED - the automatic step failed. Do it manually:
+    Machines -> $MachineName -> Settings -> Enable for computer use -> Save
+"@
+        } else {
+@"
+REMAINING MANUAL STEP:
+    Machines -> $MachineName -> Settings -> Enable for computer use -> Save
+    (or re-run with -EnableComputerUse -OrgUrl <https://org.crm.dynamics.com>)
+"@
+        }
         Write-Host @"
 Machine '$MachineName' is installed and registered, and should now appear at:
     make.powerautomate.com -> Machines
 
-REMAINING MANUAL STEP (no documented API):
-    Machines -> $MachineName -> Settings -> Enable for computer use -> Save
-
+$computerUseLine
 Poll readiness from the backend via the Dataverse flowmachine table:
     GET /api/data/v9.2/flowmachines?`$filter=name eq '$MachineName'
         &`$select=name,statuscode,lastheartbeatdate,agentversion

@@ -66,7 +66,32 @@ that involves.
    what makes the machine appear in Power Automate: the runtime authenticates
    *outbound* and creates the `flowmachine` record in Dataverse. There is no
    agentless path.
-5. **Browser extensions** — adds the Power Automate extension ID to the
+5. **Enable for computer use — optional, `-EnableComputerUse`.** Normally a
+   human has to open the portal and flip Machines → *machine* → Settings →
+   Enable for computer use. With `-EnableComputerUse` and `-OrgUrl`, the script
+   does it over the Dataverse Web API instead, using the same service principal
+   it registered with.
+
+   It is not a machine setting — it is the `usagetype` column on the machine's
+   **group** (`1` = computer use, `0` = default desktop flows). The script finds
+   the machine, reads `_flowmachinegroupid_value`, checks the group's current
+   `usagetype`, and `PATCH`es only if needed:
+
+   ```
+   PATCH <OrgUrl>/api/data/v9.2/flowmachinegroups(<groupid>)
+   { "usagetype": 1 }
+   ```
+
+   It then re-reads the value to confirm it took. Re-running reports *already
+   enabled* and issues no PATCH.
+
+   > ⚠️ **This applies to every machine in that group**, not just this one.
+   >
+   > ⚠️ `usagetype` is **not in Microsoft's published schema reference**. It uses
+   > the supported Dataverse Web API and works today, but treat it as
+   > undocumented — the step fails soft, so any error warns, prints the manual
+   > portal fallback, and lets the run finish reporting registration success.
+6. **Browser extensions** — adds the Power Automate extension ID to the
    `ExtensionInstallForcelist` machine policy for both browsers:
 
    | Browser | Policy key | Extension ID (v2.27+) |
@@ -218,6 +243,12 @@ $env:PAD_SECRET = '<client secret>'
 .\Setup_PAD_Final.ps1 -Register Yes -EnvironmentId '<env-guid>' -ApplicationId '<app-id>' -TenantId '<tenant-id>' -MachineName 'CUA-UAT-01'
 ```
 
+End to end with no portal interaction at all, including computer use:
+
+```bash
+.\Setup_PAD_Final.ps1 -Register Yes -EnableComputerUse -OrgUrl 'https://<org>.crm.dynamics.com' -EnvironmentId '<env-guid>' -ApplicationId '<app-id>' -TenantId '<tenant-id>'
+```
+
 `-MachineName` is optional; it defaults to the computer name.
 
 ### Parameters
@@ -228,6 +259,8 @@ $env:PAD_SECRET = '<client secret>'
 | `-ApplicationId` | Application (client) ID of the app registration. Asked for if registering and not supplied. |
 | `-TenantId` | Directory (tenant) ID. Asked for if registering and not supplied. |
 | `-Register` | `Ask` (default, prompts), `Yes` (register without prompting), `No` (skip registration). Unattended runs must pass `Yes` or `No`. |
+| `-EnableComputerUse` | After registering, enable the machine for computer use instead of toggling it in the portal. Applies to the whole machine group. Fails soft. |
+| `-OrgUrl` | Dataverse org URL, e.g. `https://orgc0ee9ebb.crm.dynamics.com`. Required with `-EnableComputerUse`; asked for if not supplied. |
 | `-MachineName` | Defaults to `$env:COMPUTERNAME`. |
 | `-MachineDescription` | Free text shown in the portal. Defaults to `CUA`. |
 | `-InstallerUrl` | Override the installer download link. |
@@ -267,10 +300,13 @@ first thing to check when a registration fails.
 
 ### After a successful run
 
-The machine appears at **make.powerautomate.com → Machines**. One step has no
-documented API and must be done in the portal:
+The machine appears at **make.powerautomate.com → Machines**. Unless you passed
+`-EnableComputerUse`, one step remains and must be done in the portal:
 
 > Machines → *your machine* → **Settings** → **Enable for computer use** → Save
+
+The closing summary tells you which applies — enabled, failed with the manual
+fallback, or not attempted.
 
 Readiness can be polled from Dataverse instead of the UI:
 
