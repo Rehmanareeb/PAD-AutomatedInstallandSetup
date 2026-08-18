@@ -53,17 +53,24 @@ that involves.
    `-Register Yes` or `-Register No` to answer without prompting — unattended
    runs must do this, since there is nothing to answer the prompt.
 
-   **Already connected?** If `-OrgUrl` is supplied, the script asks Dataverse
-   whether a machine of this name is already registered to the environment
-   before doing anything. If it is, registration is **skipped** — it reports the
-   status and last heartbeat and moves on to the computer-use check. `-Force`
-   re-registers regardless. Without `-OrgUrl` there is no way to check, so it
-   registers as before.
+   **Already registered?** Before asking anything, the script reads Power
+   Automate's own registration record:
 
-   > The match is on machine **name** within the environment — the only handle
-   > available. A machine of the same name registered from a *different* box is
-   > indistinguishable from here. If the check itself fails (bad secret, no
-   > network) it warns and proceeds with registration rather than stopping.
+   ```
+   HKLM:\SOFTWARE\WOW6432Node\Microsoft\Power Automate Desktop\Registration
+     RegistrationState : Registered
+     MachineId / GroupIds / OrgUri / TenantId
+   ```
+
+   If `RegistrationState` is `Registered`, **the prompt above is not shown at
+   all** — registration is skipped, and the run goes straight to the
+   computer-use check. `-Force` registers again anyway. This needs no
+   credentials and no network, and it is authoritative for *this* box, which
+   asking Dataverse by machine name is not.
+
+   It also means `-OrgUrl` and `-TenantId` are read from `OrgUri`/`TenantId` in
+   that key when you don't pass them, and `GroupIds` gives the machine group
+   directly, so the computer-use step skips its lookup entirely.
 
    On **1**, it then asks for the details it needs — environment ID, tenant ID,
    application ID, and the client secret if `PAD_SECRET` is unset (masked input).
@@ -272,7 +279,7 @@ End to end with no portal interaction at all, including computer use:
 | `-TenantId` | Directory (tenant) ID. Asked for if registering and not supplied. |
 | `-Register` | `Ask` (default, prompts), `Yes` (register without prompting), `No` (skip registration). Unattended runs must pass `Yes` or `No`. |
 | `-EnableComputerUse` | After registering, enable the machine for computer use instead of toggling it in the portal. Applies to the whole machine group. Fails soft. |
-| `-OrgUrl` | Dataverse org URL, e.g. `https://orgc0ee9ebb.crm.dynamics.com`. Required with `-EnableComputerUse`; asked for if not supplied. Supplying it also enables the already-connected check before registering. |
+| `-OrgUrl` | Dataverse org URL. A bare host (`orgc0ee9ebb.crm.dynamics.com`) is accepted and normalised. Needed for `-EnableComputerUse`; taken from the local registration when the machine is already registered, otherwise asked for. |
 | `-MachineName` | Defaults to `$env:COMPUTERNAME`. |
 | `-MachineDescription` | Free text shown in the portal. Defaults to `CUA`. |
 | `-InstallerUrl` | Override the installer download link. |

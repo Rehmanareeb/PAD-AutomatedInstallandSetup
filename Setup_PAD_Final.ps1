@@ -242,24 +242,70 @@ function Read-RequiredGuid {
     throw "No valid $Label given. Pass it as a parameter instead."
 }
 
+function ConvertTo-OrgUrl {
+    <#
+      Normalise anything org-shaped to https://<org>.crm.dynamics.com:
+        orgc0ee9ebb.crm.dynamics.com          -> adds the scheme
+        https://orgc0ee9ebb.api.crm.../       -> drops 'api.' and the trailing /
+      The registry stores the .api. host, but the token scope and the Web API
+      both want the plain org host. Returns $null if it is not org-shaped.
+    #>
+    param([string]$Value)
+
+    if (-not $Value) { return $null }
+    $v = $Value.Trim()
+    if ($v -notmatch '^[a-z]+://') { $v = "https://$v" }      # bare hostname
+    $uri = $v -as [uri]
+    if (-not $uri -or $uri.Scheme -ne 'https' -or -not $uri.Host) { return $null }
+    return "https://$($uri.Host -replace '\.api\.', '.')"
+}
+
 function Read-RequiredOrgUrl {
     <# Same shape as Read-RequiredGuid, for the Dataverse org URL. #>
     param([string]$Label, [string]$Current)
 
-    $isOrgUrl = {
-        param($v)
-        ($v -as [uri]) -and ([uri]$v).Scheme -eq 'https' -and ([uri]$v).Host
-    }
     if ($Current) {
-        if (& $isOrgUrl $Current) { return $Current.TrimEnd('/') }
-        throw "-$Label is not a valid https URL: '$Current'"
+        $norm = ConvertTo-OrgUrl $Current
+        if ($norm) { return $norm }
+        throw "-$Label is not a usable org URL: '$Current'"
     }
     foreach ($attempt in 1..3) {
-        $value = (Read-Host "    $Label (e.g. https://orgc0ee9ebb.crm.dynamics.com)").Trim()
-        if (& $isOrgUrl $value) { return $value.TrimEnd('/') }
-        Write-Host '    Not a valid https URL.' -ForegroundColor Yellow
+        $value = Read-Host "    $Label (e.g. orgc0ee9ebb.crm.dynamics.com)"
+        $norm  = ConvertTo-OrgUrl $value
+        if ($norm) { return $norm }
+        Write-Host '    Not a usable org URL.' -ForegroundColor Yellow
     }
     throw "No valid $Label given. Pass it as a parameter instead."
+}
+
+function Get-LocalRegistration {
+    <#
+      Power Automate records its own registration under HKLM. This is the
+      authoritative answer to "is THIS box registered", and needs no credentials
+      and no network - unlike asking Dataverse, which can only match on machine
+      name and cannot tell two same-named machines apart.
+
+      GroupIds is the machine group the computer-use flag lives on, so this also
+      removes the group lookup entirely.
+    #>
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Power Automate Desktop\Registration',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Power Automate Desktop\Registration'
+    )
+    foreach ($key in $keys) {
+        if (-not (Test-Path $key)) { continue }
+        $r = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+        if (-not $r -or $r.RegistrationState -ne 'Registered') { continue }
+        return [pscustomobject]@{
+            MachineId = $r.MachineId
+            # Comma-separated in principle; a machine belongs to one group here.
+            GroupId   = ($r.GroupIds -split ',' | Where-Object { $_ } | Select-Object -First 1).Trim()
+            OrgUrl    = ConvertTo-OrgUrl $r.OrgUri
+            TenantId  = $r.TenantId
+            Key       = $key
+        }
+    }
+    return $null
 }
 
 function Read-RegistrationDetails {
@@ -558,36 +604,6 @@ function Find-FlowMachine {
     return $null
 }
 
-function Get-MachineConnection {
-    <#
-      Is this machine already connected to the environment? Returns the row, or
-      $null if it is not registered or the check could not be made. Fail-soft:
-      a check that errors must not stop us attempting the registration.
-    #>
-    param([string]$Org, [string]$Tenant, [string]$AppId, [string]$Secret, [string]$Machine)
-
-    Write-Step "Checking whether '$Machine' is already connected"
-    try {
-        $token = Get-DataverseToken -Org $Org -Tenant $Tenant -AppId $AppId -Secret $Secret
-        $row   = Find-FlowMachine -Org $Org -Token $token -Machine $Machine
-    }
-    catch {
-        Write-Warning "Could not check for an existing connection: $($_.Exception.Message)"
-        Write-Info 'Continuing as if not registered.'
-        return $null
-    }
-
-    if (-not $row) {
-        Write-Info 'Not registered in this environment yet.'
-        return $null
-    }
-    # statuscode 1 = Active. Anything else is registered but unhealthy, which is
-    # still registered - re-registering would not fix it and breaks connections.
-    $state = if ($row.statuscode -eq 1) { 'Active' } else { "statuscode $($row.statuscode)" }
-    Write-Ok "Already connected ($state, last heartbeat $($row.lastheartbeatdate))."
-    return $row
-}
-
 function Enable-ComputerUse {
     <#
       "Enable for computer use" is not a machine setting - it is the usagetype
@@ -604,6 +620,9 @@ function Enable-ComputerUse {
         [string]$AppId,
         [string]$Secret,
         [string]$Machine,
+        # Straight from the local registration when we have it; otherwise looked
+        # up by machine name.
+        [string]$GroupId,
         [int]$LookupAttempts = 3
     )
 
@@ -612,24 +631,27 @@ function Enable-ComputerUse {
     $token = Get-DataverseToken -Org $Org -Tenant $Tenant -AppId $AppId -Secret $Secret
     Write-Info "Authenticated to $Org"
 
-    # 1. Find the machine and the group it belongs to. Several attempts: a
-    #    just-registered machine can take a moment to appear.
-    # $machineRow, not $machine - PowerShell variables are case-insensitive, so
-    # $machine would clobber the $Machine parameter.
-    $machineRow = Find-FlowMachine -Org $Org -Token $token -Machine $Machine -Attempts $LookupAttempts
+    if ($GroupId) {
+        Write-Info "Machine group from local registration: $GroupId"
+    } else {
+        # Several attempts: a just-registered machine can take a moment to appear.
+        # $machineRow, not $machine - PowerShell variables are case-insensitive,
+        # so $machine would clobber the $Machine parameter.
+        $machineRow = Find-FlowMachine -Org $Org -Token $token -Machine $Machine -Attempts $LookupAttempts
+        if (-not $machineRow) {
+            Write-Warning "No machine named '$Machine' found in this environment - cannot enable computer use."
+            return $false
+        }
+        Write-Info ("Machine found (statuscode {0}, last heartbeat {1})" -f
+                    $machineRow.statuscode, $machineRow.lastheartbeatdate)
 
-    if (-not $machineRow) {
-        Write-Warning "No machine named '$Machine' found in this environment - cannot enable computer use."
-        return $false
+        $GroupId = $machineRow._flowmachinegroupid_value
+        if (-not $GroupId) {
+            Write-Warning "Machine '$Machine' has no machine group assigned. The computer-use flag lives on the group, so there is nothing to set."
+            return $false
+        }
     }
-    Write-Info ("Machine found (statuscode {0}, last heartbeat {1})" -f
-                $machineRow.statuscode, $machineRow.lastheartbeatdate)
-
-    $groupId = $machineRow._flowmachinegroupid_value
-    if (-not $groupId) {
-        Write-Warning "Machine '$Machine' has no machine group assigned. The computer-use flag lives on the group, so there is nothing to set."
-        return $false
-    }
+    $groupId = $GroupId
 
     # 2. Read the group. Already enabled means no PATCH at all.
     $group = Invoke-Dataverse -Method Get -Token $token `
@@ -666,13 +688,38 @@ try {
     Test-WindowsEdition
     Test-Connectivity
 
+    # Is this box already registered? Answered from the local registration
+    # record, so it costs nothing and happens before we ask anything.
+    $local = Get-LocalRegistration
+    $alreadyConnected = $false
+    if ($local -and -not $Force) {
+        Write-Step 'Machine is already registered'
+        Write-Info "Org: $($local.OrgUrl)"
+        Write-Info "Machine ID: $($local.MachineId)"
+        Write-Info "Machine group: $($local.GroupId)"
+        Write-Info 'Skipping registration. Re-run with -Force to register again (this breaks existing connections).'
+        $alreadyConnected = $true
+
+        # Defaults from the registration itself, so neither has to be passed.
+        if (-not $OrgUrl -and $local.OrgUrl)     { $OrgUrl   = $local.OrgUrl }
+        if (-not $TenantId -and $local.TenantId) { $TenantId = $local.TenantId }
+    }
+
     # Details and credential are collected BEFORE the download, so a typo or a
     # missing secret fails in seconds rather than after a several-minute install.
-    $doRegister = Confirm-Registration
+    $doRegister = if ($alreadyConnected) { $false } else { Confirm-Registration }
     $cred = $null
     if ($doRegister) {
         Read-RegistrationDetails
         $cred = Get-PadSecret
+    }
+    elseif ($alreadyConnected -and $EnableComputerUse) {
+        # Registration is done, but the Dataverse call still needs an identity.
+        Write-Step 'Computer-use details'
+        $OrgUrl        = Read-RequiredOrgUrl 'OrgUrl'        $OrgUrl
+        $TenantId      = Read-RequiredGuid   'TenantId'      $TenantId
+        $ApplicationId = Read-RequiredGuid   'ApplicationId' $ApplicationId
+        $cred          = Get-PadSecret
     }
 
     Install-Pad
@@ -680,45 +727,37 @@ try {
 
     # $null = not attempted, $true/$false = attempted with that outcome.
     $computerUse = $null
-    $alreadyConnected = $false
+
     if ($doRegister) {
-        # With an org URL we can ask Dataverse whether this machine is already
-        # connected, and skip a registration that would only re-do itself.
-        # -Force re-registers regardless.
-        if ($OrgUrl -and -not $Force) {
-            $existing = Get-MachineConnection -Org $OrgUrl -Tenant $TenantId `
-                -AppId $ApplicationId -Secret $cred -Machine $MachineName
-            $alreadyConnected = [bool]$existing
-        }
+        Register-Machine -Credential $cred
+        Confirm-Runtime
+        # The machine group id only exists locally once registration has run.
+        $local = Get-LocalRegistration
+    }
 
-        if ($alreadyConnected) {
-            Write-Info 'Skipping registration. Re-run with -Force to register again (this breaks existing connections).'
-        } else {
-            Register-Machine -Credential $cred
-            Confirm-Runtime
+    if ($EnableComputerUse -and ($doRegister -or $alreadyConnected)) {
+        # Undocumented column: never let it fail the run. Registration has
+        # already succeeded by this point and the portal toggle still works.
+        try {
+            $computerUse = Enable-ComputerUse -Org $OrgUrl -Tenant $TenantId `
+                -AppId $ApplicationId -Secret $cred -Machine $MachineName `
+                -GroupId $local.GroupId
         }
-
-        if ($EnableComputerUse) {
-            # Undocumented column: never let it fail the run. Registration has
-            # already succeeded by this point and the portal toggle still works.
-            try {
-                $computerUse = Enable-ComputerUse -Org $OrgUrl -Tenant $TenantId `
-                    -AppId $ApplicationId -Secret $cred -Machine $MachineName
-            }
-            catch {
-                $computerUse = $false
-                Write-Warning $_.Exception.Message
-            }
-            if (-not $computerUse) {
-                Write-Host @"
+        catch {
+            $computerUse = $false
+            Write-Warning $_.Exception.Message
+        }
+        if (-not $computerUse) {
+            Write-Host @"
 Could not enable computer use automatically.
 Enable it manually: Power Automate > Machines > $MachineName > Settings >
 Enable for computer use.
 "@ -ForegroundColor Yellow
-            }
         }
+    }
 
-        # Held until here because the computer-use step needs the same secret.
+    # Held until here because the computer-use step needs the same secret.
+    if ($cred) {
         $cred = $null
         Remove-Item Env:\PAD_SECRET -ErrorAction SilentlyContinue
     }
@@ -726,7 +765,7 @@ Enable for computer use.
     Enable-BrowserExtensions
 
     Write-Step 'Setup complete'
-    if ($doRegister) {
+    if ($doRegister -or $alreadyConnected) {
         $computerUseLine = if ($computerUse) {
 @"
 It is ENABLED FOR COMPUTER USE and ready to use.
@@ -741,7 +780,7 @@ COMPUTER USE IS NOT ENABLED - the automatic step failed. Do it manually:
 @"
 REMAINING MANUAL STEP:
     Machines -> $MachineName -> Settings -> Enable for computer use -> Save
-    (or re-run with -EnableComputerUse -OrgUrl <https://org.crm.dynamics.com>)
+    (or re-run with -EnableComputerUse)
 "@
         }
         $stateLine = if ($alreadyConnected) {
