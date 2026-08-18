@@ -351,7 +351,8 @@ Ready when `statuscode = 1` (Active) with a recent `lastheartbeatdate`.
 | Registration fails | No application user for the app in that environment; Microsoft Flow Service permissions never admin-consented; expired or mistyped client secret; the app user lacks **Desktop Flows Machine Owner**; or a stale registration (re-run with `-Force`). |
 | Registration fails: already registered | The machine is bound to another environment. Re-run with `-Force` — this breaks existing connections to it. |
 | Machine registers but never goes Active | Machine-runtime service not running (the script tries to start it), or outbound connectivity dropped after registration. |
-| `-EnableComputerUse` fails with **403** | A Dataverse authorization failure, never an Entra one — the Microsoft Flow Service permissions are irrelevant here. The message carries Dataverse's own reason: `0x80072560` / *not a member of the organization* means the app has **no application user** in that environment; a `prv…flowmachinegroup` code means the app user exists but its security role lacks that privilege. Fix in admin.powerplatform.com → Environments → *env* → Settings → Users + permissions → Application users. |
+| `-EnableComputerUse` fails with **403**, `0x80072560` / *not a member of the organization* | The app has **no application user** in that environment. Registration succeeding proves nothing here — it goes through the Flow Service, which is a separate authorization path from Dataverse. Create the app user (see step 2 above). |
+| `-EnableComputerUse` fails with **403**, *does not have ReadAccess/WriteAccess right(s) … Flow Machine Group* | The app user exists but only has **Desktop Flows Machine Owner**, which is User-level: it covers machines and groups *that user owns*. Machine groups are owned by whoever registered the machine, so the app user cannot see them. Needs Business-Unit depth — see the custom role below. |
 
 ## Security notes
 
@@ -359,6 +360,27 @@ Ready when `statuscode = 1` (Active) with a recent `lastheartbeatdate`.
   stdin. It never appears in the command line, the console log, or the script's
   output. `PAD_SECRET` is cleared after registering.
 - Give the application user the least role that works — **Desktop Flows Machine
-  Owner** is usually enough; System Administrator is not required.
+  Owner** is enough to register machines; System Administrator is not required.
+
+### Extra role needed for `-EnableComputerUse`
+
+Registering a machine and flipping the computer-use flag need different rights.
+**Desktop Flows Machine Owner** covers only machines and groups the app user
+*owns*, and a machine group is owned by whoever registered the machine — so the
+app user gets a 403 reading a group it did not create. There is no built-in role
+with the right depth short of System Administrator, so add a small custom one:
+
+1. admin.powerplatform.com → **Environments** → the environment → **Settings** →
+   **Users + permissions** → **Security roles** → **+ New role**.
+2. Name it (e.g. `PAD Computer Use`), business unit = root.
+3. On the **Custom Entities** tab set **Flow Machine Group** → **Read** and
+   **Write** to **Business Unit** depth. Add **Flow Machine** → **Read** at the
+   same depth if machines are ever looked up by name (any run without a local
+   registration record).
+4. **Save**, then Application users → the app user → **Edit security roles** and
+   tick the new role *in addition to* Desktop Flows Machine Owner.
+
+Grant Read and Write together: the script reads the group first to skip a
+redundant write, so a read-only grant just moves the 403 one line down.
 - Client secrets expire. Note the expiry set in step 6 and rotate before it
   lapses, or new machine registrations will start failing.
