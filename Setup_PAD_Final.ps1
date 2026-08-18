@@ -13,7 +13,8 @@
     3. Register the machine to the environment, and verify the machine-runtime
        service is running. This is what makes it appear in Power Automate; there
        is no agentless path and the PAD GUI is never launched.
-       Optional - see -Register.
+       Optional - see -Register. Skipped when -OrgUrl shows the machine is
+       already connected, unless -Force.
     4. Optionally enable the machine for computer use - see -EnableComputerUse.
     5. Force-install the Power Automate extension in Chrome and Edge via machine policy,
        so it is enabled and the user cannot turn it off.
@@ -532,6 +533,61 @@ function Invoke-Dataverse {
     return Invoke-RestMethod @call
 }
 
+function Find-FlowMachine {
+    <#
+      The machine's row in Dataverse. Present = registered to this environment.
+
+      Matched on NAME within the environment, which is the only handle we have -
+      a machine of the same name registered from a DIFFERENT box looks identical
+      from here. Attempts > 1 covers the lag after a fresh registration.
+    #>
+    param([string]$Org, [string]$Token, [string]$Machine, [int]$Attempts = 1)
+
+    $filter = "name eq '$($Machine -replace "'", "''")'"
+    $query  = "$Org/api/data/v9.2/flowmachines?`$filter=$([uri]::EscapeDataString($filter))" +
+              '&$select=name,statuscode,lastheartbeatdate,_flowmachinegroupid_value'
+
+    foreach ($attempt in 1..$Attempts) {
+        $row = (Invoke-Dataverse -Method Get -Uri $query -Token $Token).value | Select-Object -First 1
+        if ($row) { return $row }
+        if ($attempt -lt $Attempts) {
+            Write-Info "Machine not visible in Dataverse yet (attempt $attempt) - retrying in 5s"
+            Start-Sleep -Seconds 5
+        }
+    }
+    return $null
+}
+
+function Get-MachineConnection {
+    <#
+      Is this machine already connected to the environment? Returns the row, or
+      $null if it is not registered or the check could not be made. Fail-soft:
+      a check that errors must not stop us attempting the registration.
+    #>
+    param([string]$Org, [string]$Tenant, [string]$AppId, [string]$Secret, [string]$Machine)
+
+    Write-Step "Checking whether '$Machine' is already connected"
+    try {
+        $token = Get-DataverseToken -Org $Org -Tenant $Tenant -AppId $AppId -Secret $Secret
+        $row   = Find-FlowMachine -Org $Org -Token $token -Machine $Machine
+    }
+    catch {
+        Write-Warning "Could not check for an existing connection: $($_.Exception.Message)"
+        Write-Info 'Continuing as if not registered.'
+        return $null
+    }
+
+    if (-not $row) {
+        Write-Info 'Not registered in this environment yet.'
+        return $null
+    }
+    # statuscode 1 = Active. Anything else is registered but unhealthy, which is
+    # still registered - re-registering would not fix it and breaks connections.
+    $state = if ($row.statuscode -eq 1) { 'Active' } else { "statuscode $($row.statuscode)" }
+    Write-Ok "Already connected ($state, last heartbeat $($row.lastheartbeatdate))."
+    return $row
+}
+
 function Enable-ComputerUse {
     <#
       "Enable for computer use" is not a machine setting - it is the usagetype
@@ -547,7 +603,8 @@ function Enable-ComputerUse {
         [string]$Tenant,
         [string]$AppId,
         [string]$Secret,
-        [string]$Machine
+        [string]$Machine,
+        [int]$LookupAttempts = 3
     )
 
     Write-Step "Enabling '$Machine' for computer use"
@@ -555,13 +612,11 @@ function Enable-ComputerUse {
     $token = Get-DataverseToken -Org $Org -Tenant $Tenant -AppId $AppId -Secret $Secret
     Write-Info "Authenticated to $Org"
 
-    # 1. Find the machine and the group it belongs to.
-    $filter = "name eq '$($Machine -replace "'", "''")'"
-    $query  = "$api/flowmachines?`$filter=$([uri]::EscapeDataString($filter))" +
-              '&$select=name,statuscode,lastheartbeatdate,_flowmachinegroupid_value'
+    # 1. Find the machine and the group it belongs to. Several attempts: a
+    #    just-registered machine can take a moment to appear.
     # $machineRow, not $machine - PowerShell variables are case-insensitive, so
     # $machine would clobber the $Machine parameter.
-    $machineRow = (Invoke-Dataverse -Method Get -Uri $query -Token $token).value | Select-Object -First 1
+    $machineRow = Find-FlowMachine -Org $Org -Token $token -Machine $Machine -Attempts $LookupAttempts
 
     if (-not $machineRow) {
         Write-Warning "No machine named '$Machine' found in this environment - cannot enable computer use."
@@ -625,9 +680,23 @@ try {
 
     # $null = not attempted, $true/$false = attempted with that outcome.
     $computerUse = $null
+    $alreadyConnected = $false
     if ($doRegister) {
-        Register-Machine -Credential $cred
-        Confirm-Runtime
+        # With an org URL we can ask Dataverse whether this machine is already
+        # connected, and skip a registration that would only re-do itself.
+        # -Force re-registers regardless.
+        if ($OrgUrl -and -not $Force) {
+            $existing = Get-MachineConnection -Org $OrgUrl -Tenant $TenantId `
+                -AppId $ApplicationId -Secret $cred -Machine $MachineName
+            $alreadyConnected = [bool]$existing
+        }
+
+        if ($alreadyConnected) {
+            Write-Info 'Skipping registration. Re-run with -Force to register again (this breaks existing connections).'
+        } else {
+            Register-Machine -Credential $cred
+            Confirm-Runtime
+        }
 
         if ($EnableComputerUse) {
             # Undocumented column: never let it fail the run. Registration has
@@ -675,8 +744,13 @@ REMAINING MANUAL STEP:
     (or re-run with -EnableComputerUse -OrgUrl <https://org.crm.dynamics.com>)
 "@
         }
+        $stateLine = if ($alreadyConnected) {
+            "Machine '$MachineName' was ALREADY CONNECTED - registration was skipped. It appears at:"
+        } else {
+            "Machine '$MachineName' is installed and registered, and should now appear at:"
+        }
         Write-Host @"
-Machine '$MachineName' is installed and registered, and should now appear at:
+$stateLine
     make.powerautomate.com -> Machines
 
 $computerUseLine
