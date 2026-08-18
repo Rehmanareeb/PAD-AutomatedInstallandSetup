@@ -351,6 +351,7 @@ Ready when `statuscode = 1` (Active) with a recent `lastheartbeatdate`.
 | Registration fails | No application user for the app in that environment; Microsoft Flow Service permissions never admin-consented; expired or mistyped client secret; the app user lacks **Desktop Flows Machine Owner**; or a stale registration (re-run with `-Force`). |
 | Registration fails: already registered | The machine is bound to another environment. Re-run with `-Force` — this breaks existing connections to it. |
 | Machine registers but never goes Active | Machine-runtime service not running (the script tries to start it), or outbound connectivity dropped after registration. |
+| `-EnableComputerUse` fails with **403** | A Dataverse authorization failure, never an Entra one — the Microsoft Flow Service permissions are irrelevant here. The message carries Dataverse's own reason: `0x80072560` / *not a member of the organization* means the app has **no application user** in that environment; a `prv…flowmachinegroup` code means the app user exists but its security role lacks that privilege. Fix in admin.powerplatform.com → Environments → *env* → Settings → Users + permissions → Application users. |
 
 ## Security notes
 

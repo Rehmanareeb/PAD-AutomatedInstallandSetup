@@ -557,6 +557,35 @@ function Get-DataverseToken {
     return $token.access_token
 }
 
+function Get-DataverseError {
+    <#
+      Dataverse explains itself in the response body; the status code alone
+      cannot tell "app has no application user here" from "its role lacks the
+      privilege". PS 7 exposes the body on ErrorDetails, 5.1 often only in the
+      raw stream - so try both.
+    #>
+    param($ErrorRecord)
+
+    $body = $ErrorRecord.ErrorDetails.Message
+    if (-not $body) {
+        # PS 5.1: WebException carries a readable stream. PS 7 has no
+        # GetResponseStream, so this probe just yields $null and we fall through.
+        $stream = $null
+        try { $stream = $ErrorRecord.Exception.Response.GetResponseStream() } catch { }
+        if ($stream) {
+            try {
+                $stream.Position = 0
+                $body = (New-Object System.IO.StreamReader($stream)).ReadToEnd()
+            } catch { }
+        }
+    }
+    if (-not $body) { return $ErrorRecord.Exception.Message }
+
+    try { $parsed = ($body | ConvertFrom-Json).error } catch { return $body }
+    if ($parsed.message) { return "$($parsed.message) [code $($parsed.code)]" }
+    return $body
+}
+
 function Invoke-Dataverse {
     param([string]$Method, [string]$Uri, $Body, [string]$Token)
 
@@ -576,7 +605,12 @@ function Invoke-Dataverse {
         $call['Body']        = ($Body | ConvertTo-Json -Compress)
         $call['ContentType'] = 'application/json'
     }
-    return Invoke-RestMethod @call
+    try { return Invoke-RestMethod @call }
+    catch {
+        # Query string dropped: it is noise here, and keeps any filter value out
+        # of the message.
+        throw "$Method $($Uri -replace '\?.*$', '') failed: $(Get-DataverseError $_)"
+    }
 }
 
 function Find-FlowMachine {
