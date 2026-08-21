@@ -8,6 +8,7 @@
 !/.gitignore
 !/README.md
 !/Setup_PAD_Final.ps1
+!/Probe-CuaConnection.ps1
 
 # Never track agent/tooling state, whatever the rules above allow
 .claude/
