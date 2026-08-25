@@ -373,10 +373,22 @@ with the right depth short of System Administrator, so add a small custom one:
 1. admin.powerplatform.com → **Environments** → the environment → **Settings** →
    **Users + permissions** → **Security roles** → **+ New role**.
 2. Name it (e.g. `PAD Computer Use`), business unit = root.
-3. On the **Custom Entities** tab set **Flow Machine Group** → **Read** and
-   **Write** to **Business Unit** depth. Add **Flow Machine** → **Read** at the
-   same depth if machines are ever looked up by name (any run without a local
-   registration record).
+3. On the **Custom Entities** tab set the following, all at **Business Unit**
+   depth:
+
+   | Table | Rights | Needed for |
+   |---|---|---|
+   | Flow Machine Group | Read, Write | `-EnableComputerUse` |
+   | Flow Machine | Read | machine lookup by name, when there is no local registration record |
+   | Bot Component | Read, Write | [Probe-CuaConnection.ps1](Probe-CuaConnection.ps1) — the agent's Computer Use action |
+   | Connection Reference | Read | reading which connection the agent resolves to |
+
+   Connection Reference **Write** is deliberately not listed: repointing a
+   connection reference makes Dataverse check the caller's permission on the
+   *target connection*, and Computer Use connections are created with
+   `allowSharing: false`, so a service principal can never hold it. Granting the
+   privilege does not help — the write fails with `ConnectionAuthorizationFailed`
+   regardless. Binding a connection for the first time is a portal step.
 4. **Save**, then Application users → the app user → **Edit security roles** and
    tick the new role *in addition to* Desktop Flows Machine Owner.
 

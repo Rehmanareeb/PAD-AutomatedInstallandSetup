@@ -12,11 +12,25 @@
   rewriting that connection id moves the agent to a different machine. Publish
   the agent afterwards - the change does not reach the runtime until you do.
 
-  Without -SetActionConnectionId / -ConnectionName this only reads and reports.
+  Without -SetConnectionId / -ConnectionName this only reads and reports.
+  Connection ids and display names come from: pac connection list
 
-  Authenticates with the same app registration and PAD_SECRET as
-  Setup_PAD_Final.ps1. Needs Bot Component and Connection Reference (Read +
-  Write, Business Unit) on the application user's security role.
+  Sign in with one of
+      -UseAzureCli    silent, reuses an existing `az login`
+      -Interactive    device code, sign in as yourself
+      -ApplicationId  app-only, client secret in $env:PAD_SECRET
+
+  App-only is enough to read, and enough to switch between connections that
+  already have a reference row - that writes only the link and the action's
+  YAML. Creating a row also writes connectionid, which the connectivity service
+  only lets the connection's owner do: proven 2026-08-25, the app registration
+  fails with code 10006 even holding System Administrator. Use -UseAzureCli or
+  -Interactive for that.
+
+  The application user needs Bot Component and Connection Reference
+  (Read + Write, Business Unit) on its security role.
+
+  Every parameter: Get-Help .\Probe-CuaConnection.ps1 -Full
 
 .EXAMPLE
   $env:PAD_SECRET = '<client secret>'
@@ -26,35 +40,33 @@
   # Report the current binding only.
   .\Probe-CuaConnection.ps1 -ApplicationId <app-guid>
 #>
-[CmdletBinding(DefaultParameterSetName = 'Run')]
+[CmdletBinding()]
 param(
-    # Print usage and exit. In its own parameter set so -Help alone works
-    # without PowerShell prompting for -ApplicationId.
-    [Parameter(ParameterSetName = 'Help')][switch]$Help,
-    [Parameter(Mandatory, ParameterSetName = 'Run')][string]$ApplicationId,
+    [string]$ApplicationId,
+    # Sign in as a person, in a browser.
+    [switch]$Interactive,
+    # Take the same delegated token from an existing `az login`, with no prompt.
+    [switch]$UseAzureCli,
     # Both default to the local PAD registration, as in Setup_PAD_Final.ps1.
     [string]$OrgUrl,
     [string]$TenantId,
     # Widen to see every connection reference, not just Computer Use ones.
     [switch]$All,
-    # Repoint the Computer Use connection reference at a different connection,
-    # e.g. 'shared-computeropera-<guid>'. This is what switches machines: the
+    # Repoint the Computer Use action at a different connection, e.g.
+    # 'shared-computeropera-<guid>'. This is what switches machines: the
     # connection carries the machine and its Windows credential. Writes to live
     # agent configuration, so it asks first.
     [string]$SetConnectionId,
-    # Dump every column of the Computer Use row instead of the five we usually
-    # select. Use it to diff a working (designer-bound) state against a broken
-    # (PATCH-bound) one and find the column the designer sets that we do not.
-    [switch]$Raw,
-    # Rewrite the Computer Use ACTION's connectionReference to name this
-    # connection. Proven 2026-08-19: the runtime resolves the machine from this
-    # string, not from connectionreference.connectionid - a PATCH of the latter
-    # left the agent running on the old machine.
-    [string]$SetActionConnectionId,
-    # Same as -SetActionConnectionId but by connection display name, resolved via
-    # `pac connection list`. Needs a pac auth profile (`pac auth create`).
-    # Name connections after their machine and this reads as -ConnectionName VM-Desktop.
-    [string]$ConnectionName
+    # Same, by connection display name, resolved via `pac connection list`.
+    # Name connections after their machine and this reads as
+    # -ConnectionName VM-Desktop.
+    [string]$ConnectionName,
+    # Delete every Computer Use connection reference, so the designer can mint a
+    # fresh one without hitting the unique-key collision. Leaves the agent
+    # unbound until you pick a machine in the designer.
+    [switch]$Reset,
+    # Delete one reference row, by the connection id in its name.
+    [string]$DeleteConnectionId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,46 +76,15 @@ function Write-Step($m) { Write-Host "`n==> $m" -ForegroundColor Cyan }
 function Write-Ok  ($m) { Write-Host "    $m" -ForegroundColor Green }
 function Write-Info($m) { Write-Host "    $m" }
 
-if ($Help) {
-    Write-Host @'
-Probe-CuaConnection.ps1 - switch the machine the agent's Computer Use tool runs on.
-
-  The machine is chosen by one line in the Computer Use action, stored in the
-  Dataverse botcomponents table. Each connection targets one machine, so
-  rewriting the connection id there moves the agent.
-
-REQUIRED
-  -ApplicationId <guid>    App registration used for Dataverse. Its application
-                           user needs Bot Component and Connection Reference
-                           (Read + Write, Business Unit).
-  $env:PAD_SECRET          Client secret for that app. Prompted for if unset.
-
-PICK A CONNECTION (one of, optional - omit both to only report)
-  -SetActionConnectionId <id>   Bind by connection id.
-  -ConnectionName <name>        Bind by connection display name, resolved with
-                                pac. Lists the names if it does not match.
-
-OPTIONAL
-  -OrgUrl <url>            Default: read from the local PAD registration.
-  -TenantId <guid>         Default: read from the local PAD registration.
-  -Help                    This text.
-
-DIAGNOSTIC
-  -All                     List every connection reference, not just Computer Use.
-  -Raw                     Dump every column of the Computer Use row.
-  -SetConnectionId <id>    Repoint connectionreference.connectionid. Kept for
-                           reference only - proven NOT to change the machine.
-
-EXAMPLES
-  $env:PAD_SECRET = '<secret>'
-  .\Probe-CuaConnection.ps1 -ApplicationId <app> -ConnectionName VM-Desktop
-  .\Probe-CuaConnection.ps1 -ApplicationId <app>          # report current binding
-
-  Writing the binding does NOT publish. Publish from the designer afterwards.
-  -ConnectionName needs pac signed in:
-  pac auth create --environment https://<org>.crm.dynamics.com
-'@
-    return
+function Get-ErrorBody($e) {
+    <# Dataverse and AAD both explain themselves in the response body; a bare
+       status code does not. #>
+    if ($e.ErrorDetails.Message) { return $e.ErrorDetails.Message }
+    try {
+        $s = $e.Exception.Response.GetResponseStream(); $s.Position = 0
+        return (New-Object System.IO.StreamReader($s)).ReadToEnd()
+    }
+    catch { return $e.Exception.Message }
 }
 
 function Get-LocalReg {
@@ -121,49 +102,115 @@ if (-not $OrgUrl -and $reg.OrgUri) {
 if (-not $TenantId) { $TenantId = $reg.TenantId }
 if (-not $OrgUrl -or -not $TenantId) { throw 'No OrgUrl/TenantId given and none found in the local registration.' }
 
-$secret = $env:PAD_SECRET
-if (-not $secret) {
-    $secure = Read-Host 'Client secret' -AsSecureString
-    $secret = [System.Net.NetworkCredential]::new('', $secure).Password
-}
-if (-not $secret) { throw 'No client secret given. Set PAD_SECRET or type it at the prompt.' }
+function Get-DeviceCodeToken {
+    <# Delegated sign-in, for the writes app-only is not allowed to make. #>
+    param([string]$Tenant, [string]$ClientId, [string]$Scope)
 
-$token = (Invoke-RestMethod -Method Post `
-    -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-    -Body @{
-        grant_type    = 'client_credentials'
-        client_id     = $ApplicationId
-        client_secret = $secret
-        scope         = "$OrgUrl/.default"
-    }).access_token
-$secret = $null
-Write-Host "Authenticated to $OrgUrl as the app (client credentials)" -ForegroundColor Green
+    $code = Invoke-RestMethod -Method Post `
+        -Uri "https://login.microsoftonline.com/$Tenant/oauth2/v2.0/devicecode" `
+        -Body @{ client_id = $ClientId; scope = $Scope }
+
+    Write-Host "`n$($code.message)`n" -ForegroundColor Yellow
+
+    $deadline = (Get-Date).AddSeconds([int]$code.expires_in)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds ([int]$code.interval)
+        try {
+            return (Invoke-RestMethod -Method Post `
+                -Uri "https://login.microsoftonline.com/$Tenant/oauth2/v2.0/token" `
+                -Body @{
+                    grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+                    client_id   = $ClientId
+                    device_code = $code.device_code
+                }).access_token
+        }
+        catch {
+            # authorization_pending is the normal "not signed in yet" response;
+            # anything else is fatal and worth showing verbatim.
+            $body = Get-ErrorBody $_
+            $err  = ''
+            try { $err = ($body | ConvertFrom-Json).error } catch { }
+            if ($err -eq 'authorization_pending') { continue }
+            if ($err -eq 'slow_down') { Start-Sleep -Seconds 5; continue }
+            throw "Sign-in failed: $body"
+        }
+    }
+    throw 'Device code expired before sign-in completed.'
+}
+
+if ($UseAzureCli) {
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+        throw 'Azure CLI (az) not found. Install it, or use -Interactive.'
+    }
+    # --query/-o tsv so the token never lands in a file or the process list.
+    $token = az account get-access-token --resource $OrgUrl --query accessToken -o tsv 2>&1
+    if ($LASTEXITCODE -ne 0 -or -not $token) {
+        throw "az could not get a token for $OrgUrl. Run 'az login' as the account that owns the connections.`n$token"
+    }
+    Write-Ok "Authenticated to $OrgUrl as $(az account show --query 'user.name' -o tsv 2>$null) (delegated, via az)"
+}
+elseif ($Interactive) {
+    # Microsoft's own public client, which every tenant already trusts for
+    # Dataverse - no app registration and no "allow public client flows" needed.
+    $clientId = if ($ApplicationId) { $ApplicationId } else { '51f81489-12ee-4a9e-aaae-a2591f45987d' }
+    $token = Get-DeviceCodeToken -Tenant $TenantId -ClientId $clientId -Scope "$OrgUrl/.default offline_access"
+    Write-Ok "Authenticated to $OrgUrl as you (delegated)"
+}
+else {
+    if (-not $ApplicationId) {
+        throw 'Pass -UseAzureCli (silent, uses an existing az login), -Interactive (device code), or -ApplicationId for app-only reads.'
+    }
+
+    $secret = $env:PAD_SECRET
+    if (-not $secret) {
+        $secure = Read-Host 'Client secret' -AsSecureString
+        $secret = [System.Net.NetworkCredential]::new('', $secure).Password
+    }
+    if (-not $secret) { throw 'No client secret given. Set PAD_SECRET or type it at the prompt.' }
+
+    $token = (Invoke-RestMethod -Method Post `
+        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+        -Body @{
+            grant_type    = 'client_credentials'
+            client_id     = $ApplicationId
+            client_secret = $secret
+            scope         = "$OrgUrl/.default"
+        }).access_token
+    $secret = $null
+    Write-Ok "Authenticated to $OrgUrl as the app (client credentials)"
+}
 
 $headers = @{ Authorization = "Bearer $token"; Accept = 'application/json' }
-$select  = 'connectionreferenceid,connectionreferencelogicalname,connectionreferencedisplayname,connectorid,connectionid'
-$uri     = "$OrgUrl/api/data/v9.2/connectionreferences?`$select=$select"
-if ($Raw) {
-    # No $select at all - we are looking for a column we do not know the name of.
-    $uri = "$OrgUrl/api/data/v9.2/connectionreferences"
-}
-if (-not $All) {
-    $filter = "contains(connectorid,'computeroperator')"
-    # .Contains, not -like '*?*' - in a wildcard, ? matches any single character.
-    $uri += "$(if ($uri.Contains('?')) { '&' } else { '?' })`$filter=$([uri]::EscapeDataString($filter))"
+
+function Invoke-Dv {
+    param([string]$Method = 'Get', [string]$Path, $Body, [string]$Solution)
+
+    $call = @{ Method = $Method; Uri = "$OrgUrl/api/data/v9.2/$Path"; Headers = $headers }
+    if ($Body) {
+        # If-Match keeps a PATCH update-only; without it Dataverse would upsert.
+        if ($Method -eq 'Patch') { $call.Headers = $call.Headers + @{ 'If-Match' = '*' } }
+        # Without this the row lands in the Default solution only, and the agent
+        # publishes a package that does not contain it - which the runtime reports
+        # as SystemError on every message.
+        if ($Solution) { $call.Headers = $call.Headers + @{ 'MSCRM.SolutionUniqueName' = $Solution } }
+        $call.ContentType = 'application/json'
+        $call.Body        = ($Body | ConvertTo-Json -Compress)
+    }
+    try { return Invoke-RestMethod @call }
+    catch {
+        $body = Get-ErrorBody $_
+        $msg  = $body
+        try { $msg = ($body | ConvertFrom-Json).error.message } catch { }
+        throw "$Method $($Path -replace '\?.*$', '') failed: $msg"
+    }
 }
 
-try { $rows = (Invoke-RestMethod -Method Get -Uri $uri -Headers $headers).value }
-catch {
-    # Dataverse explains itself in the body; a bare status code does not.
-    $body = $_.ErrorDetails.Message
-    if (-not $body) {
-        try {
-            $s = $_.Exception.Response.GetResponseStream(); $s.Position = 0
-            $body = (New-Object System.IO.StreamReader($s)).ReadToEnd()
-        } catch { }
-    }
-    throw "Query failed: $(if ($body) { $body } else { $_.Exception.Message })"
+$path = 'connectionreferences?$select=connectionreferenceid,connectionreferencelogicalname,' +
+        'connectionreferencedisplayname,connectorid,connectionid'
+if (-not $All) {
+    $path += '&$filter=' + [uri]::EscapeDataString("contains(connectorid,'computeroperator')")
 }
+$rows = @((Invoke-Dv -Path $path).value)
 
 if (-not $rows) {
     if (-not $All) {
@@ -171,52 +218,25 @@ if (-not $rows) {
         return
     }
 
-    # Zero rows has two very different causes and they need opposite fixes:
-    # privilege filtering (Dataverse silently trims a collection query to rows
-    # the caller can see) or simply the wrong environment. Looking for the
-    # agent's own solution tells us which - if it is not here, no amount of role
-    # editing will help.
+    # Two causes look identical from here - no privilege, or the wrong
+    # environment. Whether the CUA solution is installed tells them apart.
     Write-Warning 'No connection references visible at all.'
-    try {
-        $f    = "contains(uniquename,'CUAExecutionValidator')"
-        $sols = (Invoke-RestMethod -Method Get -Headers $headers `
-            -Uri ("$OrgUrl/api/data/v9.2/solutions?`$select=uniquename,version" +
-                  "&`$filter=$([uri]::EscapeDataString($f))")).value
+    $f = [uri]::EscapeDataString("contains(uniquename,'CUAExecutionValidator')")
+    if ((Invoke-Dv -Path "solutions?`$select=uniquename&`$filter=$f").value) {
+        Write-Host @'
 
-        if ($sols) {
-            Write-Host "`nThe CUA solution IS in this environment:" -ForegroundColor Green
-            $sols | ForEach-Object { "    $($_.uniquename) $($_.version)" }
-            Write-Host @'
-
-So this is privilege filtering, not the wrong environment. Add Connection
-Reference (Read + Write, Business Unit) to the PAD Computer Use role, then
-re-run.
+The CUA solution IS in this environment, so this is privilege filtering, not the
+wrong org. Add Connection Reference (Read + Write, Business Unit) to the PAD
+Computer Use role, then re-run.
 '@ -ForegroundColor Yellow
-        } else {
-            Write-Host @"
+    } else {
+        Write-Host @"
 
-The CUA solution is NOT in this environment ($OrgUrl).
-
-That, not privileges, is why nothing came back: this org is where the PAD
-machine is registered, but the agent lives somewhere else. Point -OrgUrl at
-the agent's environment before touching security roles.
+The CUA solution is NOT in $OrgUrl. That, not privileges, is why nothing came
+back: this org is where the PAD machine is registered, but the agent lives
+somewhere else. Point -OrgUrl at the agent's environment before touching
+security roles.
 "@ -ForegroundColor Yellow
-        }
-    }
-    catch {
-        Write-Warning "Could not read the solutions table either, so the cause is still open: $($_.Exception.Message)"
-    }
-    return
-}
-
-if ($Raw) {
-    # Sorted so two dumps diff cleanly.
-    $rows | ForEach-Object {
-        $r = $_
-        $o = [ordered]@{}
-        $r.PSObject.Properties.Name | Where-Object { $_ -notlike '*@odata*' } | Sort-Object |
-            ForEach-Object { $o[$_] = $r.$_ }
-        [pscustomobject]$o | ConvertTo-Json -Depth 5
     }
     return
 }
@@ -232,25 +252,19 @@ $rows | ForEach-Object {
 } | Out-Host
 
 function Resolve-ConnectionId {
-    <#
-      Connections live outside Dataverse and we have no API token that can read
-      them, but pac can. Its output is a fixed table, so: id, then a name that
-      may contain spaces, then the /providers/... api id, then status.
-    #>
     param([string]$Name)
 
     if (-not (Get-Command pac -ErrorAction SilentlyContinue)) {
-        throw 'Power Platform CLI (pac) not found - install from https://aka.ms/PowerAppsCLI, or pass -SetActionConnectionId with the raw id instead.'
+        throw 'Power Platform CLI (pac) not found - install from https://aka.ms/PowerAppsCLI, or pass -SetConnectionId with the raw id instead.'
     }
     $out = pac connection list 2>&1
     if ($LASTEXITCODE -ne 0) { throw "pac connection list failed - run 'pac auth create' first.`n$out" }
 
-    $rows = $out | ForEach-Object {
-        if ($_ -match '^(\S+)\s+(.*?)\s+(/providers/\S+)\s+(\S+)\s*$') {
-            [pscustomobject]@{ Id = $Matches[1]; Name = $Matches[2].Trim(); Api = $Matches[3] }
+    $cua = @($out | ForEach-Object {
+        if ($_ -match '^(\S+)\s+(.*?)\s+(/providers/\S*shared_computeroperator)\s+\S+\s*$') {
+            [pscustomobject]@{ Id = $Matches[1]; Name = $Matches[2].Trim() }
         }
-    }
-    $cua = @($rows | Where-Object { $_.Api -like '*shared_computeroperator' })
+    })
     $hit = @($cua | Where-Object { $_.Name -eq $Name })
 
     if ($hit.Count -eq 1) { return $hit[0].Id }
@@ -261,129 +275,173 @@ function Resolve-ConnectionId {
 }
 
 if ($ConnectionName) {
-    if ($SetActionConnectionId) { throw 'Pass -ConnectionName or -SetActionConnectionId, not both.' }
-    $SetActionConnectionId = Resolve-ConnectionId $ConnectionName
-    Write-Host "Resolved '$ConnectionName' -> $SetActionConnectionId" -ForegroundColor Green
+    if ($SetConnectionId) { throw 'Pass -ConnectionName or -SetConnectionId, not both.' }
+    $SetConnectionId = Resolve-ConnectionId $ConnectionName
+    Write-Ok "Resolved '$ConnectionName' -> $SetConnectionId"
 }
 
-if ($SetActionConnectionId) {
-    $f = [uri]::EscapeDataString("contains(schemaname,'Computeruse')")
-    $comp = (Invoke-RestMethod -Headers $headers `
-        -Uri "$OrgUrl/api/data/v9.2/botcomponents?`$select=botcomponentid,schemaname,data&`$filter=$f").value
-    if ($comp.Count -ne 1) { throw "Expected one Computer Use bot component, found $($comp.Count)." }
-    $comp = $comp[0]
+if (-not $SetConnectionId -and -not $Reset -and -not $DeleteConnectionId) { return }
 
-    # …shared_computeroperator.<connection-id> - swap only the last segment.
-    $pattern = '(?m)^(\s*connectionReference:\s*\S*\.shared_computeroperator\.)(\S+)\s*$'
-    $m = [regex]::Match($comp.data, $pattern)
-    if (-not $m.Success) { throw 'Could not find the connectionReference line in the bot component.' }
-    $current = $m.Groups[2].Value
-
-    if ($current -eq $SetActionConnectionId) {
-        Write-Host "Action already bound to $SetActionConnectionId - nothing to do." -ForegroundColor Green
+if ($Reset -or $DeleteConnectionId) {
+    $victims = @($rows | Where-Object {
+        $_.connectorid -like '*computeroperator*' -and (-not $DeleteConnectionId -or
+        $_.connectionreferencelogicalname -like "*.shared_computeroperator.$DeleteConnectionId")
+    })
+    if (-not $victims) {
+        Write-Warning ("Nothing to delete. Present:`n" +
+            (($rows | ForEach-Object { "    $($_.connectionreferencelogicalname)" }) -join "`n"))
         return
     }
 
-    Write-Host @"
+    Write-Host "`nAbout to DELETE $($victims.Count) Computer Use connection reference(s):" -ForegroundColor Yellow
+    $victims | ForEach-Object { Write-Info $_.connectionreferencelogicalname }
+    Write-Host @'
 
-About to rewrite the Computer Use ACTION binding:
-    component  $($comp.schemaname)
-    from       $current
-    to         $SetActionConnectionId
-
-This is the string the runtime resolves the machine from.
-"@ -ForegroundColor Yellow
+If the agent's action names one of these, the agent has no machine bound until
+you pick one in the designer. Do that straight after - the designer creates the
+reference itself, and with none left behind its save cannot hit the unique-key
+collision.
+'@ -ForegroundColor Yellow
     if ((Read-Host 'Type YES to proceed') -ne 'YES') { Write-Host 'Cancelled.'; return }
 
-    $newData = [regex]::Replace($comp.data, $pattern, { param($x)
-        $x.Groups[1].Value + $SetActionConnectionId })
-
-    try {
-        Invoke-RestMethod -Method Patch `
-            -Uri "$OrgUrl/api/data/v9.2/botcomponents($($comp.botcomponentid))" `
-            -Headers ($headers + @{ 'If-Match' = '*' }) -ContentType 'application/json' `
-            -Body (@{ data = $newData } | ConvertTo-Json -Compress) | Out-Null
+    foreach ($v in $victims) {
+        Invoke-Dv -Method Delete -Path "connectionreferences($($v.connectionreferenceid))" | Out-Null
+        Write-Info "deleted $($v.connectionreferencelogicalname)"
     }
-    catch {
-        $body = $_.ErrorDetails.Message
-        if (-not $body) {
-            try {
-                $s = $_.Exception.Response.GetResponseStream(); $s.Position = 0
-                $body = (New-Object System.IO.StreamReader($s)).ReadToEnd()
-            } catch { }
-        }
-        throw "PATCH failed: $(if ($body) { $body } else { $_.Exception.Message })"
-    }
+    Write-Ok 'Removed. Now open the agent designer, pick the machine, save and publish.'
+    return
+}
 
-    $after = (Invoke-RestMethod -Headers $headers `
-        -Uri "$OrgUrl/api/data/v9.2/botcomponents($($comp.botcomponentid))?`$select=data").data
-    $now = [regex]::Match($after, $pattern).Groups[2].Value
-    if ($now -ne $SetActionConnectionId) {
-        Write-Warning "PATCH reported success but the binding reads back as '$now'. The column is server-controlled."
-        return
-    }
-    Write-Ok "Action now bound to $now"
+$f = [uri]::EscapeDataString("contains(schemaname,'Computeruse')")
+$comp = @((Invoke-Dv -Path "botcomponents?`$select=botcomponentid,schemaname,data&`$filter=$f").value)
+if ($comp.Count -ne 1) { throw "Expected one Computer Use bot component, found $($comp.Count)." }
+$comp = $comp[0]
 
-    Write-Host @"
+$linePattern = '(?m)^(\s*connectionReference:\s*)(\S+?)(?=[ \t\r]*$)'
+$m = [regex]::Match($comp.data, $linePattern)
+if (-not $m.Success) { throw 'Could not find the connectionReference line in the bot component.' }
+$actionName = $m.Groups[2].Value
+if ($actionName -notmatch '\.shared_computeroperator\.') {
+    throw "The action names '$actionName', which is not a Computer Use connection reference."
+}
+
+$prefix     = ($actionName -split '\.shared_computeroperator\.')[0]
+$targetName = "$prefix.shared_computeroperator.$SetConnectionId"
+$targetRow  = @($rows | Where-Object { $_.connectionreferencelogicalname -eq $targetName })[0]
+
+if ($actionName -eq $targetName -and $targetRow) {
+    Write-Host "Already on $SetConnectionId - nothing to do." -ForegroundColor Green
+    return
+}
+
+# The connection reference has to live in the same solution as the action, or it
+# is not in the package the agent publishes. Read it off the action rather than
+# hardcoding a name, so this survives being renamed or reused on another agent.
+$solutionName = @(@((Invoke-Dv -Path ("solutioncomponents?`$select=_solutionid_value&`$filter=" +
+    [uri]::EscapeDataString("objectid eq $($comp.botcomponentid)"))).value) | ForEach-Object {
+        (Invoke-Dv -Path "solutions($($_._solutionid_value))?`$select=uniquename").uniquename
+    } | Where-Object { $_ -notin 'Default', 'Active' })[0]
+if (-not $solutionName) {
+    throw 'The Computer Use action is not in any solution but Default, so there is nowhere to put the connection reference. Bind a machine once in the designer instead.'
+}
+
+$mine = @($rows | Where-Object { $_.connectionreferencelogicalname -like "$prefix.shared_computeroperator.*" })
+
+Write-Host @"
+
+About to switch the Computer Use machine:
+    reference row  $(if ($targetRow) { "reuse $($targetRow.connectionreferenceid)" } else { "create '$targetName'" })
+    action         $actionName
+                -> $targetName
+
+Existing reference rows are left alone - they are what future switches select
+between. $($mine.Count) exist now.
+
+This changes which machine the live agent runs on.
+"@ -ForegroundColor Yellow
+if ((Read-Host 'Type YES to proceed') -ne 'YES') { Write-Host 'Cancelled.'; return }
+
+$linkNav = 'botcomponent_connectionreference'
+
+Write-Step 'Connection reference'
+if ($targetRow) {
+    Write-Info "Row '$targetName' already exists"
+} else {
+    Invoke-Dv -Method Post -Path 'connectionreferences' -Solution $solutionName `
+        -Body @{
+            connectionreferencelogicalname = $targetName
+            connectionreferencedisplayname = $targetName
+            connectorid                    = '/providers/Microsoft.PowerApps/apis/shared_computeroperator'
+            connectionid                   = $SetConnectionId
+            iscustomizable                 = @{ Value = $false }
+        } | Out-Null
+    $targetRow = @((Invoke-Dv -Path ("connectionreferences?`$select=connectionreferenceid&`$filter=" +
+        [uri]::EscapeDataString("connectionreferencelogicalname eq '$targetName'"))).value)[0]
+    if (-not $targetRow) { throw "Created '$targetName' but it cannot be read back." }
+    Write-Ok "Created '$targetName' in solution $solutionName"
+}
+
+Write-Step 'Action link'
+$linked = @((Invoke-Dv -Path "botcomponents($($comp.botcomponentid))?`$select=botcomponentid&`$expand=$linkNav(`$select=connectionreferenceid)").$linkNav)
+
+foreach ($l in $linked | Where-Object { $_.connectionreferenceid -ne $targetRow.connectionreferenceid }) {
+    Invoke-Dv -Method Delete -Path "botcomponents($($comp.botcomponentid))/$linkNav($($l.connectionreferenceid))/`$ref" | Out-Null
+    Write-Info "unlinked $($l.connectionreferenceid)"
+}
+if ($targetRow.connectionreferenceid -in $linked.connectionreferenceid) {
+    Write-Info 'Already linked'
+} else {
+    Invoke-Dv -Method Post -Path "botcomponents($($comp.botcomponentid))/$linkNav/`$ref" `
+        -Body @{ '@odata.id' = "$OrgUrl/api/data/v9.2/connectionreferences($($targetRow.connectionreferenceid))" } | Out-Null
+    Write-Ok "Linked action to $($targetRow.connectionreferenceid)"
+}
+
+Write-Step 'Computer Use action'
+if ($actionName -eq $targetName) {
+    Write-Info 'Action already names this row'
+} else {
+    $newData = [regex]::Replace($comp.data, $linePattern, { param($x) $x.Groups[1].Value + $targetName })
+    Invoke-Dv -Method Patch -Path "botcomponents($($comp.botcomponentid))" -Body @{ data = $newData } | Out-Null
+    Write-Ok 'Repointed'
+}
+
+Write-Step 'Verifying'
+$nowName = [regex]::Match((Invoke-Dv -Path "botcomponents($($comp.botcomponentid))?`$select=data").data, $linePattern).Groups[2].Value
+$nowRow  = @((Invoke-Dv -Path ("connectionreferences?`$select=connectionreferenceid,connectionreferencelogicalname,connectionid&`$filter=" +
+    [uri]::EscapeDataString("connectionreferencelogicalname eq '$nowName'"))).value)[0]
+
+if ($nowName -ne $targetName) { Write-Warning "The action reads back as '$nowName'."; return }
+if (-not $nowRow)             { Write-Warning "No row answers to '$nowName'. Re-run to repair."; return }
+if ($nowRow.connectionid -ne $SetConnectionId) {
+    Write-Warning "The row reads back with connectionid '$($nowRow.connectionid)'."
+    return
+}
+
+$inSolution = @(@((Invoke-Dv -Path ("solutioncomponents?`$select=_solutionid_value&`$filter=" +
+    [uri]::EscapeDataString("objectid eq $($nowRow.connectionreferenceid)"))).value) | ForEach-Object {
+        (Invoke-Dv -Path "solutions($($_._solutionid_value))?`$select=uniquename").uniquename
+    })
+if ($solutionName -notin $inSolution) {
+    Write-Warning "The connection reference is not in solution '$solutionName' (only: $($inSolution -join ', ')). The published agent will not contain it."
+    return
+}
+
+# The link is the binding, so verify it rather than trusting the POST.
+$nowLinked = @((Invoke-Dv -Path "botcomponents($($comp.botcomponentid))?`$select=botcomponentid&`$expand=$linkNav(`$select=connectionreferenceid)").$linkNav)
+if ($nowLinked.Count -ne 1 -or $nowLinked[0].connectionreferenceid -ne $nowRow.connectionreferenceid) {
+    Write-Warning ("The action is linked to $($nowLinked.Count) reference(s): $($nowLinked.connectionreferenceid -join ', ') - expected only $($nowRow.connectionreferenceid).")
+    return
+}
+
+Write-Ok "link     -> $($nowRow.connectionreferenceid)"
+Write-Ok "action   -> ...$SetConnectionId"
+Write-Ok "row      -> connectionid $($nowRow.connectionid)"
+Write-Ok "solution -> $solutionName"
+
+Write-Host @"
 
 NOT PUBLISHED. The runtime stays on the old machine until you publish, either
 from the designer or with:
 
     pac copilot publish --environment $OrgUrl --bot <agent-schema-name>
 "@ -ForegroundColor Yellow
-    return
-}
-
-if (-not $SetConnectionId) { return }
-
-$cua = @($rows | Where-Object { $_.connectorid -like '*computeroperator*' })
-if ($cua.Count -ne 1) {
-    throw "Expected exactly one Computer Use connection reference, found $($cua.Count). Repoint it by hand rather than guessing."
-}
-$ref = $cua[0]
-
-if ($ref.connectionid -eq $SetConnectionId) {
-    Write-Host "Already pointing at $SetConnectionId - nothing to do." -ForegroundColor Green
-    return
-}
-
-Write-Host @"
-
-About to repoint the Computer Use action:
-    ref   $($ref.connectionreferenceid)
-    from  $($ref.connectionid)
-    to    $SetConnectionId
-
-This changes which machine the live agent runs on.
-"@ -ForegroundColor Yellow
-if ((Read-Host 'Type YES to proceed') -ne 'YES') { Write-Host 'Cancelled.'; return }
-
-try {
-    # If-Match makes this update-only; without it Dataverse would happily upsert
-    # a new connection reference row.
-    Invoke-RestMethod -Method Patch `
-        -Uri "$OrgUrl/api/data/v9.2/connectionreferences($($ref.connectionreferenceid))" `
-        -Headers ($headers + @{ 'If-Match' = '*' }) -ContentType 'application/json' `
-        -Body (@{ connectionid = $SetConnectionId } | ConvertTo-Json -Compress) | Out-Null
-}
-catch {
-    $body = $_.ErrorDetails.Message
-    if (-not $body) {
-        try {
-            $s = $_.Exception.Response.GetResponseStream(); $s.Position = 0
-            $body = (New-Object System.IO.StreamReader($s)).ReadToEnd()
-        } catch { }
-    }
-    throw "PATCH failed: $(if ($body) { $body } else { $_.Exception.Message })"
-}
-
-# Read back rather than trusting the 204 - the column may be server-controlled.
-$after = (Invoke-RestMethod -Method Get -Headers $headers `
-    -Uri "$OrgUrl/api/data/v9.2/connectionreferences($($ref.connectionreferenceid))?`$select=connectionid").connectionid
-
-if ($after -eq $SetConnectionId) {
-    Write-Host "Repointed. connectionid is now $after" -ForegroundColor Green
-    Write-Host 'Test the agent before trusting it: the runtime may cache the old binding until republish.'
-} else {
-    Write-Warning "PATCH reported success but connectionid reads back as '$after'. The column is not freely writable - this route does not work."
-}
