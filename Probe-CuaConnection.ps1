@@ -66,7 +66,13 @@ param(
     # unbound until you pick a machine in the designer.
     [switch]$Reset,
     # Delete one reference row, by the connection id in its name.
-    [string]$DeleteConnectionId
+    [string]$DeleteConnectionId,
+    # Publishing is what moves the live agent - the binding is only authoring
+    # state until then - so it happens by default, and only after all four
+    # checks pass. Pass -NoPublish to write the binding and stop.
+    [switch]$NoPublish,
+    # Agent to publish. Schema name or guid.
+    [string]$Bot = 'cr720_Agent2UITesting'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -357,7 +363,8 @@ About to switch the Computer Use machine:
 Existing reference rows are left alone - they are what future switches select
 between. $($mine.Count) exist now.
 
-This changes which machine the live agent runs on.
+This changes which machine the live agent runs on$(if (-not $NoPublish) { ", and publishes $Bot
+afterwards so it takes effect immediately" }).
 "@ -ForegroundColor Yellow
 if ((Read-Host 'Type YES to proceed') -ne 'YES') { Write-Host 'Cancelled.'; return }
 
@@ -438,10 +445,26 @@ Write-Ok "action   -> ...$SetConnectionId"
 Write-Ok "row      -> connectionid $($nowRow.connectionid)"
 Write-Ok "solution -> $solutionName"
 
-Write-Host @"
+if ($NoPublish) {
+    Write-Host @"
 
-NOT PUBLISHED. The runtime stays on the old machine until you publish, either
-from the designer or with:
+NOT PUBLISHED, because -NoPublish was passed. The runtime stays on the old
+machine until you publish, either from the designer or with:
 
-    pac copilot publish --environment $OrgUrl --bot <agent-schema-name>
+    pac copilot publish --environment $OrgUrl --bot $Bot
 "@ -ForegroundColor Yellow
+    return
+}
+
+# Only reached once the link, action, connectionid and solution all verified -
+# publishing a half-written binding succeeds and then fails every conversation.
+Write-Step "Publishing $Bot"
+if (-not (Get-Command pac -ErrorAction SilentlyContinue)) {
+    throw "Power Platform CLI (pac) not found - install from https://aka.ms/PowerAppsCLI, or publish from the designer. The binding is already written."
+}
+$out = pac copilot publish --environment $OrgUrl --bot $Bot 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw ("Publish failed. The binding is written, so publish from the designer or re-run with -Publish:`n" +
+           ($out -join "`n"))
+}
+Write-Ok 'Published.'
