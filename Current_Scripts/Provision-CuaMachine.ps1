@@ -17,6 +17,10 @@
   Runs ON the machine being provisioned, as Administrator. Phases 1 and 2 act on
   this box; 3 to 5 act on the cloud.
 
+  The Azure CLI and the Power Platform CLI are installed from their MSIs if they
+  are missing, before any other work. pac is only needed to publish, so it is
+  skipped under -NoPublish.
+
   AUTHENTICATION
 
   Phases 3 to 5 always run as the account signed into the Azure CLI. They cannot
@@ -96,6 +100,12 @@ param(
 
     # Verify the current download link from the Power Automate install docs.
     [string]$InstallerUrl = 'https://go.microsoft.com/fwlink/?linkid=2102613',
+
+    # Installed automatically if missing. az is needed from phase 2 onwards; pac
+    # only to publish, so it is skipped under -NoPublish.
+    [string]$AzureCliUrl = 'https://aka.ms/installazurecli-windows',
+    [string]$PacCliUrl   = 'https://aka.ms/PowerAppsCLI',
+
     [string]$WorkDir      = "$env:TEMP\pad-install",
 
     # Skip the network reachability probe (e.g. when a proxy blocks ICMP/TCP
@@ -119,6 +129,11 @@ param(
 if ($Help) { Get-Help $PSCommandPath -Detailed; return }
 
 $ErrorActionPreference = 'Stop'
+
+# Windows PowerShell 5.1 still negotiates TLS 1.0 by default on some builds, and
+# every endpoint here refuses it. Set once, before the first web call.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 $PadRoot          = "${env:ProgramFiles(x86)}\Power Automate Desktop"
 $RegExe           = Join-Path $PadRoot 'PAD.MachineRegistration.Silent.exe'
 $ConnectorApiName = 'shared_computeroperator'
@@ -262,6 +277,54 @@ function Get-PadSecret {
     }
     Write-Info 'Client secret captured (will be piped over stdin).'
     return $plain
+}
+
+function Update-PathFromRegistry {
+    <#
+      An MSI writes the new tool's folder into the machine/user PATH, but this
+      process inherited its environment at launch and will not see it. Without
+      this, Get-Command still fails right after a successful install.
+    #>
+    $fromRegistry = @([Environment]::GetEnvironmentVariable('Path', 'Machine'),
+                      [Environment]::GetEnvironmentVariable('Path', 'User')) |
+                    Where-Object { $_ }
+    # Merged, not replaced: overwriting would drop anything this session added at
+    # runtime, which is not ours to throw away.
+    $env:Path = ((($env:Path -split ';') + ($fromRegistry -split ';')) |
+                 Where-Object { $_ } | Select-Object -Unique) -join ';'
+}
+
+function Install-Cli {
+    <#
+      Install a command-line tool from its MSI if it is not already on PATH.
+      Both CLIs here ship as plain MSIs, so one helper covers both.
+    #>
+    param([string]$Command, [string]$Name, [string]$Url, [string]$FileName)
+
+    if (Get-Command $Command -ErrorAction SilentlyContinue) {
+        Write-Info "$Name present."
+        return
+    }
+
+    Write-Step "Installing $Name"
+    New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+    $msi = Join-Path $WorkDir $FileName
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $Url -OutFile $msi -UseBasicParsing
+    Write-Info ("Downloaded ({0} MB)" -f [math]::Round((Get-Item $msi).Length / 1MB, 1))
+
+    $proc = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/quiet', '/norestart') `
+        -Wait -PassThru
+    # 3010 = success, reboot required. The tool itself is usable now.
+    if ($proc.ExitCode -notin 0, 3010) {
+        throw "$Name installer failed with exit code $($proc.ExitCode). Install it by hand from $Url and re-run."
+    }
+
+    Update-PathFromRegistry
+    if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
+        throw "$Name installed but '$Command' is still not on PATH. Open a new shell and re-run."
+    }
+    Write-Ok "$Name installed."
 }
 
 function Get-InstalledPad {
@@ -646,8 +709,12 @@ function Get-AzUser {
     # az is a native exe: a failed `account show` sets $LASTEXITCODE, never throws.
     $upn = az account show --query 'user.name' -o tsv 2>$null
     if (-not $upn) {
-        Write-Info 'No Azure CLI session - launching az login.'
-        az login | Out-Null
+        # --use-device-code unless a local browser was asked for: a fresh Windows
+        # Server has no usable default browser, and plain `az login` would sit
+        # there waiting for one that never opens.
+        Write-Info 'No Azure CLI session - signing in.'
+        if ($AuthFallback -eq 'interactive') { az login | Out-Null }
+        else                                 { az login --use-device-code | Out-Null }
         $upn = az account show --query 'user.name' -o tsv 2>$null
     }
     if (-not $upn) { throw "Could not read the signed-in account. Run 'az login' and try again." }
@@ -767,6 +834,14 @@ Write-Step "Provisioning '$MachineName'"
 Assert-Admin
 Test-WindowsEdition
 Test-Connectivity
+
+Write-Step 'Command-line tools'
+Install-Cli -Command 'az' -Name 'Azure CLI' -Url $AzureCliUrl -FileName 'azure-cli.msi'
+if ($NoPublish) {
+    Write-Info 'Power Platform CLI not needed - publishing is disabled.'
+} else {
+    Install-Cli -Command 'pac' -Name 'Power Platform CLI' -Url $PacCliUrl -FileName 'powerappscli.msi'
+}
 
 # Phases 3-5 are delegated-only, so settle the identity before any work: a
 # missing az session should fail in seconds, not after a five-minute install.
