@@ -164,8 +164,12 @@ Write-Section "CREATING COMPUTER USE CONNECTION"
 $NewConnectionId = (New-Guid).Guid.Replace("-", "")
 Write-Log "New Connection ID: $NewConnectionId"
 
+# The braces on ${NewConnectionId} are load-bearing: '?' is a legal character in a
+# PowerShell variable name, so "$NewConnectionId?api-version" reads as the variable
+# $NewConnectionId?api - empty - and the API rejects the request with
+# InvalidApiVersion. Do not "simplify" them away.
 $ConnectionUrl = "https://api.powerapps.com/providers/Microsoft.PowerApps/apis/" +
-    "$ConnectorApiName/connections/$NewConnectionId?api-version=2016-11-01" +
+    "$ConnectorApiName/connections/${NewConnectionId}?api-version=2016-11-01" +
     "&%24filter=$([uri]::EscapeDataString("environment eq '$EnvironmentId'"))"
 
 $ConnectionBody = @{
@@ -287,3 +291,5 @@ Write-Section "DONE"
     'Connection Reference ID'  = $Cr.connectionreferenceid
     'Reference Logical Name'   = $CrLogicalName
 } | Format-List
+
+
