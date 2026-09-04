@@ -36,30 +36,20 @@
     3. A publish. Nothing above reaches the runtime until the agent is published.
 
 .NOTES
-  ENVIRONMENT REQUIREMENTS - see the README section at the bottom of this file.
-
-.EXAMPLE
-  .\Flow-1.ps1 -Path .\CUAExecutionValidator.zip -ResolveLibraryId
-  Stage 1 only. Prompts for the SharePoint and Dataverse URLs, packs.
-
-.EXAMPLE
-  .\Flow-1.ps1 -Everyone
-  Stage 2 only. Share with the organisation and publish.
-
-.EXAMPLE
-  .\Flow-1.ps1 -Path .\Solution.zip -OrgUrl https://org35fd7a12.crm.dynamics.com `
-               -SharePointUrl https://contoso.sharepoint.com/sites/AICOE `
-               -ResolveLibraryId -Everyone
-  Both stages: retarget, pack, then share and publish.
-
-.EXAMPLE
-  .\Flow-1.ps1
-  Report the agent's current policy and shares. Changes nothing.
+  ENVIRONMENT REQUIREMENTS - see the appendix at the bottom of this file.
+  Deploy-Solution.ps1 is unchanged and still calls the two original scripts.
 #>
 [CmdletBinding()]
 param(
-    # --- stage 1: solution -----------------------------------------------------
-    [string] $Path,
+    [switch] $Help,
+
+    # --- source ----------------------------------------------------------------
+    [string] $SolutionUrl,
+    [string] $SolutionPath,
+
+    # --- target ----------------------------------------------------------------
+    # Accepts an https org URL or a bare environment GUID.
+    [string] $EnvironmentUrl,
     [string] $SharePointUrl,
     [string] $OutFile,
     [ValidateSet('literal', 'envvar')]
@@ -70,15 +60,21 @@ param(
     [string] $Library,
     [string] $KeepSource,
 
-    # --- stage 2: agent --------------------------------------------------------
-    [string] $OrgUrl = 'https://org35fd7a12.crm.dynamics.com',   # Testing-Dyn-SP-Link
-    [string] $Bot    = 'cr720_Agent1TestScript',                 # schema name, not display name
+    # --- Graph app-only credentials, only needed by -ResolveLibraryId ----------
+    [string] $ClientId,
+    [string] $TenantId,
+    [string] $ClientSecret,
+
+    # --- agent -----------------------------------------------------------------
     [string] $UserEmail,
     [string] $RevokeUserEmail,
     [switch] $Everyone,
     [switch] $RevokeEveryone,
     [switch] $NoPublish,
 
+    # --- flow control ----------------------------------------------------------
+    [switch] $SkipImport,
+    [switch] $NoShare,
     [switch] $SelfTest
 )
 $ErrorActionPreference = 'Stop'
@@ -90,6 +86,89 @@ $EvLibrary    = 'cre44_SharePointLibraryId'
 $PolicyName = @{ 0 = 'Any (everyone in org)'; 1 = 'Copilot readers (shared principals only)'; 2 = 'Group membership'; 3 = 'Any (multi-tenant)' }
 
 function Write-Stage { param([string] $Text) Write-Host "`n=== $Text" -ForegroundColor Cyan }
+
+# ==============================================================================
+# -Help
+# ==============================================================================
+if ($Help) {
+    @'
+Flow-1.ps1 - fetch a Copilot Studio solution, retarget it, import it, share the agent.
+
+USAGE
+  .\Flow-1.ps1 -SolutionUrl <https url> -EnvironmentUrl <org url or guid> [options]
+  .\Flow-1.ps1 -Help          this text
+  .\Flow-1.ps1 -SelfTest      offline checks, touches nothing
+
+  Anything required but not passed is prompted for. Nothing is hardcoded.
+
+WHAT IT DOES, in order
+  1 fetch     downloads the solution zip, or takes a local -SolutionPath
+  2 prompt    asks for whatever you did not supply
+  3 retarget  rewrites SharePoint site, Dataverse org, optionally library id
+  4 pack      writes <name>_Changed.zip
+  5 import    pac solution import, publishing changes   (-SkipImport to skip)
+  6 share     shares the agent and publishes            (-NoShare to skip)
+
+SOURCE  (one of)
+  -SolutionUrl <url>       https link to the solution zip, e.g. a catbox link
+  -SolutionPath <file>     local zip instead of downloading
+
+TARGET
+  -EnvironmentUrl <v>      https://orgXXXX.crm.dynamics.com, or the environment GUID
+  -SharePointUrl <url>     https://<tenant>.sharepoint.com/sites/<site>
+  -Bot <schemaname>        agent SCHEMA name, e.g. cr720_Agent1TestScript
+                           (not the display name "Agent 1 Test Script")
+
+SOLUTION OPTIONS
+  -ResolveLibraryId        look the document library id up on the target site.
+                           Needs the Graph credentials below.
+  -Library <name>          library to resolve; defaults to the one the flow uses
+  -Mode literal|envvar     literal writes values in; envvar exposes them as
+                           environment variables. Default literal.
+  -PackageType <t>         Unmanaged (default), Managed or Both
+  -OutFile <path>          where to write the packed zip
+  -KeepSource <dir>        keep the unpacked folder for diffing
+
+GRAPH CREDENTIALS  (app-only, only used by -ResolveLibraryId)
+  -ClientId <guid>         app registration id
+  -TenantId <guid>         tenant id
+  -ClientSecret <value>    prefer NOT to pass this. Set GRAPH_CLIENT_SECRET
+                           instead, or let the script prompt with masked input.
+  The app needs Sites.Read.All as an APPLICATION permission, admin consented.
+
+AGENT SHARING  (pick at most one)
+  -Everyone                everyone in the organisation can chat
+  -RevokeEveryone          withdraw that; individual shares survive
+  -UserEmail <upn>         share with one user, granting a role if they need one
+  -RevokeUserEmail <upn>   revoke one user
+  -NoPublish               write the change but do not publish it
+  With none of these, the agent step reports current access and changes nothing.
+
+EXAMPLES
+  .\Flow-1.ps1 -SolutionUrl https://files.catbox.moe/abc.zip `
+               -EnvironmentUrl https://org35fd7a12.crm.dynamics.com `
+               -SharePointUrl https://contoso.sharepoint.com/sites/AICOE `
+               -Bot cr720_Agent1TestScript -Everyone
+
+  .\Flow-1.ps1 -SolutionPath .\Solution.zip -EnvironmentUrl <guid> `
+               -ResolveLibraryId -ClientId <guid> -TenantId <guid> `
+               -SkipImport -NoShare
+
+  .\Flow-1.ps1 -EnvironmentUrl https://org35fd7a12.crm.dynamics.com `
+               -Bot cr720_Agent1TestScript
+    Report who can use the agent. Changes nothing.
+
+REQUIREMENTS
+  Operator needs System Administrator in the target environment.
+  A user being shared with needs a role carrying prvReadbot plus a Copilot
+  Studio licence. Full list in the appendix at the bottom of this file.
+'@ | Write-Host
+    return
+}
+
+# ==============================================================================
+# helpers
+# ==============================================================================
 
 function Resolve-Pac {
     foreach ($n in 'pac', 'pac.cmd', 'pac.exe') {
@@ -103,6 +182,88 @@ function Resolve-Pac {
     )
     foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { return $c } }
     throw "pac (Power Platform CLI) not found. Install it with: winget install Microsoft.PowerPlatformCLI"
+}
+
+function Read-Required {
+    param([string] $Prompt)
+    do { $a = (Read-Host $Prompt).Trim() } while (-not $a)
+    $a
+}
+
+# Everything downstream unpacks and imports this file, so check it really is a
+# zip before trusting it. PK\x03\x04 is the local file header of every zip.
+function Test-ZipSignature {
+    param([string] $File)
+    if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { return $false }
+    $fs = [IO.File]::OpenRead($File)
+    try {
+        $b = [byte[]]::new(4)
+        if ($fs.Read($b, 0, 4) -lt 4) { return $false }
+        return $b[0] -eq 0x50 -and $b[1] -eq 0x4B -and $b[2] -eq 0x03 -and $b[3] -eq 0x04
+    } finally { $fs.Dispose() }
+}
+
+# An environment may be given as an org URL or as a bare GUID. Normalise to the
+# org URL, which is what the Dataverse Web API needs.
+function Resolve-EnvironmentUrl {
+    param([string] $Value)
+    $v = $Value.Trim().TrimEnd('/')
+    if ($v -match '^https://[^/]+\.dynamics\.com$') { return $v }
+    if ($v -notmatch '^[0-9a-fA-F-]{36}$') {
+        throw "Environment must be https://<org>.crm.dynamics.com or an environment GUID, got '$Value'"
+    }
+    $t = az account get-access-token --resource https://service.powerapps.com/ --query accessToken -o tsv 2>&1
+    if ($LASTEXITCODE -ne 0 -or -not $t) { throw "az could not get a token to resolve environment $v. Run 'az login'." }
+    $u = "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/$($v)?api-version=2021-04-01"
+    try { $env = Invoke-RestMethod -Uri $u -Headers @{ Authorization = "Bearer $t" } }
+    catch { throw "Could not look up environment $v : $($_.Exception.Message)" }
+    $url = $env.properties.linkedEnvironmentMetadata.instanceUrl
+    if (-not $url) { throw "Environment $v has no Dataverse database." }
+    $url.TrimEnd('/')
+}
+
+# --- Graph, app-only ----------------------------------------------------------
+function Get-GraphTokenAppOnly {
+    param([string] $Tenant, [string] $App, [string] $Secret)
+    $body = @{
+        client_id     = $App
+        client_secret = $Secret
+        scope         = 'https://graph.microsoft.com/.default'
+        grant_type    = 'client_credentials'
+    }
+    try {
+        $r = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$Tenant/oauth2/v2.0/token" `
+                               -ContentType 'application/x-www-form-urlencoded' -Body $body
+    } catch {
+        throw "Client credentials failed for app $App in tenant $Tenant. Check the id, the tenant and the secret VALUE (not the secret id). $($_.Exception.Message)"
+    }
+    if (-not $r.access_token) { throw 'Token endpoint returned no access_token.' }
+    $r.access_token
+}
+
+function Resolve-SharePointLibraryId {
+    param([string] $SiteUrl, [string] $LibraryName, [string] $Token)
+
+    $h = @{ Authorization = "Bearer $Token"; Accept = 'application/json' }
+    $u = [uri] $SiteUrl
+    try {
+        $site = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/sites/$($u.Host):$($u.AbsolutePath)" -Headers $h
+    }
+    catch {
+        throw ("Could not read site $SiteUrl via Graph: $($_.Exception.Message). " +
+               'With an app-only token a 403 almost always means Sites.Read.All is missing as an APPLICATION permission, or admin consent was never granted.')
+    }
+
+    $lists = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists?`$select=id,displayName,name" -Headers $h
+    # 'name' is the URL segment ('Shared Documents'), 'displayName' the title ('Documents')
+    $hit = @($lists.value | Where-Object { $_.name -eq $LibraryName -or $_.displayName -eq $LibraryName })
+
+    if ($hit.Count -eq 0) {
+        throw ("No library '$LibraryName' on $SiteUrl. Available:`n" +
+               (($lists.value | ForEach-Object { "    $($_.displayName)  (url: $($_.name))" }) -join "`n"))
+    }
+    if ($hit.Count -gt 1) { throw "'$LibraryName' matches $($hit.Count) lists on $SiteUrl." }
+    return $hit[0].id
 }
 
 # ==============================================================================
@@ -169,9 +330,7 @@ if ($modes.Count -gt 1) { throw "Pass only one agent mode at a time, got: $($mod
 $doSolution = [bool]$Path
 $doAgent    = ($modes.Count -gt 0) -or (-not $doSolution)
 
-# ==============================================================================
-# STAGE 1 - solution
-# ==============================================================================
+
 
 function Resolve-SharePointLibraryId {
     param([string] $SiteUrl, [string] $LibraryName)
@@ -703,67 +862,4 @@ if (-not $publishedon -or ($row.publishedon -and [datetime]$publishedon -le [dat
 Write-Host "Published at $publishedon."
 Write-Host "An open conversation keeps working until it idles out after 30 minutes. Test with a fresh session."
 
-# =============================================================================
-# ENVIRONMENT REQUIREMENTS
-# =============================================================================
-#
-# Tooling (pac, az) is deliberately not listed here - see context.md.
-# Everything below was measured against Testing-Dyn-SP-Link on 2026-09-04,
-# except where marked "expected".
-#
-# --- THE OPERATOR: the account running this script ---------------------------
-#
-#   Security role in the TARGET environment: System Administrator.
-#   That is what the account which ran this end to end holds, and it carries
-#   every privilege the script needs, all at Global depth:
-#
-#       prvSharebot     GrantAccess / RevokeAccess on the agent
-#       prvAssignRole   assigning Environment Maker to another user
-#       prvWritebot     changing accesscontrolpolicy, and publishing
-#       prvCreatebot    solution import creating/replacing agents
-#
-#   System Customizer is expected to be enough for solution import alone, but
-#   NOT for -UserEmail, which assigns a role to somebody else.
-#
-#   Also needed:
-#     - Membership of the environment's security group, if one is set on the
-#       environment. Without it the account cannot see the environment at all.
-#     - For -ResolveLibraryId: read access to the target SharePoint site. A
-#       delegated token for one named site works; note that tenant-wide site
-#       search (Sites.Read.All) is a separate, higher permission and is NOT
-#       required.
-#
-# --- THE TARGET USER: the person being granted agent access ------------------
-#
-#   1. Must already exist as a user in the target environment. Add them in the
-#      Power Platform admin center first - this script will not create them.
-#   2. Must hold a security role carrying prvReadbot. Measured:
-#
-#          Environment Maker ....... yes      Basic User .............. NO
-#          Bot Author .............. yes      Microsoft Copilot User .. NO
-#          Bot Viewer .............. yes
-#          Agent Viewer ............ yes
-#
-#      Any one of the four is enough. The script assigns Environment Maker only
-#      when none of the user's roles carries it, because that role is
-#      environment-wide and grants more than access to this one agent.
-#   3. A Microsoft Copilot Studio license, or a trial. Microsoft requires this
-#      for any user an agent is shared with.
-#   4. Membership of the environment's security group, if one is set.
-#
-# --- THE ENVIRONMENT ---------------------------------------------------------
-#
-#     - A Dataverse database, with Copilot Studio enabled.
-#     - The agent must already exist there. -Bot takes the SCHEMA name
-#       (cr720_Agent1TestScript), not the display name ("Agent 1 Test Script").
-#     - Connection references the solution carries - SharePoint, Dataverse,
-#       Computer Use - need real connections in the target environment. Import
-#       succeeds without them; the flows and agent tools fail at runtime.
-#     - For the CSV flow: the SharePoint site and its document library must
-#       exist and be reachable by whoever owns the connection.
-#
-# --- WHAT THIS SCRIPT WILL NOT DO FOR YOU ------------------------------------
-#
-#     - Create users, assign licenses, or add anyone to a security group.
-#     - Create connections for connection references.
-#     - Grant access to an agent in an environment the operator cannot see.
+
