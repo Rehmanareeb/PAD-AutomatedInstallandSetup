@@ -60,12 +60,19 @@ param(
     [string] $Library,
     [string] $KeepSource,
 
+    # Authentication the agent ends up with. The solution package CARRIES this
+    # setting, so an import overwrites whatever the target had - see the note in
+    # the appendix. 'Unchanged' leaves the package and the live agent alone.
+    [ValidateSet('Unchanged', 'Microsoft', 'None')]
+    [string] $AuthMode = 'Unchanged',
+
     # --- Graph app-only credentials, only needed by -ResolveLibraryId ----------
     [string] $ClientId,
     [string] $TenantId,
     [string] $ClientSecret,
 
     # --- agent -----------------------------------------------------------------
+    [string] $Bot,
     [string] $UserEmail,
     [string] $RevokeUserEmail,
     [switch] $Everyone,
@@ -123,6 +130,12 @@ SOLUTION OPTIONS
   -ResolveLibraryId        look the document library id up on the target site.
                            Needs the Graph credentials below.
   -Library <name>          library to resolve; defaults to the one the flow uses
+  -AuthMode <v>            Unchanged (default), Microsoft or None. The package
+                           CARRIES the agent's authentication setting, so an
+                           import overwrites the target. This solution ships
+                           Agent 1 as None, which is why a freshly imported
+                           agent shows "No authentication". Microsoft rewrites
+                           the package AND the live agent. Needs -Bot.
   -Mode literal|envvar     literal writes values in; envvar exposes them as
                            environment variables. Default literal.
   -PackageType <t>         Unmanaged (default), Managed or Both
@@ -267,6 +280,37 @@ function Resolve-SharePointLibraryId {
 }
 
 # ==============================================================================
+# authentication
+# ==============================================================================
+
+$AuthModeValue = @{ Microsoft = 2; None = 1 }   # bot.authenticationmode
+$AuthName      = @{ 0 = 'Unspecified'; 1 = 'None (no authentication)'; 2 = 'Integrated (Authenticate with Microsoft)'; 3 = 'Custom Entra ID'; 4 = 'Generic OAuth2' }
+
+# Rewrite the three authentication elements in a bots\<schema>\bot.xml.
+# Pure string in, string out, so -SelfTest can check it with no tenant.
+# The config blob is reset to the bare kind, which drops any connectionName a
+# Custom Entra setup left behind - that connection does not apply to the others.
+function Set-BotAuthXml {
+    param(
+        [string] $Xml,
+        [ValidateSet('Microsoft', 'None')] [string] $To
+    )
+    $mode    = $AuthModeValue[$To]
+    $trigger = if ($To -eq 'Microsoft') { 1 } else { 0 }   # 1 = Always, 0 = As Needed
+    $cfg     = "{`n  `"`$kind`": `"BotAuthenticationConfiguration`"`n}"
+
+    # A MatchEvaluator is used so the '$kind' in the replacement is never treated
+    # as a regex substitution.
+    $eval = [System.Text.RegularExpressions.MatchEvaluator] {
+        param($m) "<authenticationconfiguration>$cfg</authenticationconfiguration>"
+    }
+    $x = [regex]::Replace($Xml, '(?s)<authenticationconfiguration>.*?</authenticationconfiguration>', $eval)
+    $x = [regex]::Replace($x, '<authenticationmode>\s*\d+\s*</authenticationmode>',       "<authenticationmode>$mode</authenticationmode>")
+    $x = [regex]::Replace($x, '<authenticationtrigger>\s*\d+\s*</authenticationtrigger>', "<authenticationtrigger>$trigger</authenticationtrigger>")
+    $x
+}
+
+# ==============================================================================
 # policy rules - pure, and the only thing -SelfTest can check without a tenant
 # ==============================================================================
 
@@ -313,6 +357,28 @@ if ($SelfTest) {
     if ($null -ne $c.Set -or -not $c.Warn) { throw 'selftest: revoke, group membership should warn about the groups' }
     $c = Get-RevokePolicyFix -Policy 2 -Groups ''
     if ($null -ne $c.Set -or $c.Warn) { throw 'selftest: revoke, policy 2 with no groups already blocks everyone' }
+
+    $sample = @'
+<bot schemaname="x">
+  <authenticationconfiguration>{
+  "$kind": "BotAuthenticationConfiguration",
+  "connectionName": "94ef9da0-33cf-4f7f-85aa-960f74342c8c"
+}</authenticationconfiguration>
+  <authenticationmode>1</authenticationmode>
+  <authenticationtrigger>0</authenticationtrigger>
+  <iconbase64>AAAA</iconbase64>
+</bot>
+'@
+    $m = Set-BotAuthXml -Xml $sample -To Microsoft
+    if ($m -notmatch '<authenticationmode>2</authenticationmode>')       { throw 'selftest: auth Microsoft should set mode 2' }
+    if ($m -notmatch '<authenticationtrigger>1</authenticationtrigger>') { throw 'selftest: auth Microsoft should set trigger Always' }
+    if ($m -match 'connectionName')                                      { throw 'selftest: switching auth should drop the Entra connectionName' }
+    if ($m -notmatch '\$kind')                                           { throw 'selftest: the config blob must keep its $kind' }
+    if ($m -notmatch '<iconbase64>AAAA</iconbase64>')                    { throw 'selftest: auth rewrite must not touch anything else' }
+    $nn = Set-BotAuthXml -Xml $sample -To None
+    if ($nn -notmatch '<authenticationmode>1</authenticationmode>')       { throw 'selftest: auth None should set mode 1' }
+    if ($nn -notmatch '<authenticationtrigger>0</authenticationtrigger>') { throw 'selftest: auth None should set trigger As Needed' }
+
     'ok'; return
 }
 
@@ -327,42 +393,45 @@ if ($Everyone)        { $modes += 'everyone' }
 if ($RevokeEveryone)  { $modes += 'revoke-everyone' }
 if ($modes.Count -gt 1) { throw "Pass only one agent mode at a time, got: $($modes -join ', ')" }
 
-$doSolution = [bool]$Path
-$doAgent    = ($modes.Count -gt 0) -or (-not $doSolution)
-
-
-
-function Resolve-SharePointLibraryId {
-    param([string] $SiteUrl, [string] $LibraryName)
-
-    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-        throw 'Azure CLI (az) not found, needed by -ResolveLibraryId. Install it, or drop the switch and set the library id by hand.'
-    }
-    $token = az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv 2>&1
-    if ($LASTEXITCODE -ne 0 -or -not $token) {
-        throw "az could not get a Microsoft Graph token. Run 'az login' as an account that can read the target site.`n$token"
-    }
-    $h = @{ Authorization = "Bearer $token"; Accept = 'application/json' }
-
-    $u = [uri] $SiteUrl
-    try {
-        $site = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/sites/$($u.Host):$($u.AbsolutePath)" -Headers $h
-    }
-    catch {
-        throw "Could not read site $SiteUrl via Graph: $($_.Exception.Message). Check the URL and that this account has access."
-    }
-
-    $lists = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists?`$select=id,displayName,name" -Headers $h
-    # 'name' is the URL segment ('Shared Documents'), 'displayName' the title ('Documents')
-    $hit = @($lists.value | Where-Object { $_.name -eq $LibraryName -or $_.displayName -eq $LibraryName })
-
-    if ($hit.Count -eq 0) {
-        throw ("No library '$LibraryName' on $SiteUrl. Available:`n" +
-               (($lists.value | ForEach-Object { "    $($_.displayName)  (url: $($_.name))" }) -join "`n"))
-    }
-    if ($hit.Count -gt 1) { throw "'$LibraryName' matches $($hit.Count) lists on $SiteUrl." }
-    return $hit[0].id
+# --- stage 1: fetch -----------------------------------------------------------
+# -SolutionUrl / -SolutionPath are the parameters; $Path is what the solution
+# stage below reads. Resolve to one local zip here, once, so both sources land
+# in the same place.
+if ($SolutionUrl -and $SolutionPath) { throw 'Pass -SolutionUrl or -SolutionPath, not both.' }
+$Path = $null
+if ($SolutionUrl) {
+    if ($SolutionUrl -notmatch '^https://') { throw "Refusing a non-https source: $SolutionUrl" }
+    # ponytail: the downloaded zip is left in %TEMP% for the OS to reap. Add a
+    # finally-block cleanup if runs ever get frequent enough to matter.
+    $fetchDir = Join-Path ([IO.Path]::GetTempPath()) ("flow1_" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $fetchDir -Force | Out-Null
+    $Path = Join-Path $fetchDir 'solution.zip'
+    Write-Stage "Fetch $SolutionUrl"
+    Invoke-WebRequest -Uri $SolutionUrl -OutFile $Path -MaximumRedirection 5
 }
+elseif ($SolutionPath) {
+    if (-not (Test-Path -LiteralPath $SolutionPath -PathType Leaf)) { throw "Not a file: $SolutionPath" }
+    $Path = (Resolve-Path -LiteralPath $SolutionPath).Path
+}
+# Everything downstream unpacks and imports this file, so prove it is really a
+# zip. A link that 404s saves the HTML error page under a .zip name.
+if ($Path -and -not (Test-ZipSignature $Path)) { throw "Not a zip: $Path" }
+
+$doSolution = [bool]$Path
+$doImport   = $doSolution -and -not $SkipImport
+# Report-only is still worth running after an import, so the caller sees what the
+# freshly imported agent actually allows. -NoShare turns the whole stage off.
+$doAgent    = (-not $NoShare) -and (($modes.Count -gt 0) -or (-not $doSolution) -or $doImport)
+
+# -EnvironmentUrl is the parameter; $OrgUrl is what every stage below actually
+# reads. Wire them together here, once, so both stages see the same value - the
+# agent stage dereferences $OrgUrl unconditionally and would fault on $null.
+$OrgUrl = if ($EnvironmentUrl) { Resolve-EnvironmentUrl $EnvironmentUrl } else { $null }
+if (($doAgent -or $doImport) -and -not $OrgUrl) { throw 'Pass -EnvironmentUrl (org URL or environment GUID).' }
+if ($doAgent -and -not $Bot) { $Bot = Read-Required 'Agent schema name    (e.g. cr720_Agent1TestScript, NOT the display name)' }
+if ($AuthMode -ne 'Unchanged' -and -not $Bot) { $Bot = Read-Required 'Agent schema name    (-AuthMode needs to know which agent)' }
+
+
 
 function Add-FlowParameter {
     <# Declare an environment variable on the flow definition and return the
@@ -410,7 +479,7 @@ function Invoke-SolutionStage {
     param(
         [string] $SrcZip, [string] $SiteUrl, [string] $DataverseUrl, [string] $Out,
         [string] $PackMode, [string] $PackType, [bool] $DoResolveLibrary, [string] $LibraryName,
-        [string] $KeepAt
+        [string] $KeepAt, [string] $GraphToken, [string] $BotSchema, [string] $SetAuth
     )
     # The original script ran under StrictMode; keep that scoped to this stage so
     # the agent stage behaves exactly as it did before the merge.
@@ -485,7 +554,7 @@ function Invoke-SolutionStage {
                     elseif ($folderHint) { ($folderHint.Trim('/') -split '/')[0] }
                     else                 { 'Shared Documents' }
 
-                $libId = Resolve-SharePointLibraryId -SiteUrl $SiteUrl -LibraryName $libName
+                $libId = Resolve-SharePointLibraryId -SiteUrl $SiteUrl -LibraryName $libName -Token $GraphToken
                 $changes.Add("library: resolved '$libName' on the target site -> $libId")
 
                 $tableValue = $libId
@@ -642,6 +711,23 @@ function Invoke-SolutionStage {
         }
         if (-not $removedAny) { $changes.Add('import fix: nothing to remove (no orphaned app search config)') }
 
+        # The package carries the agent's authentication setting, so an import
+        # overwrites whatever the target environment had. This solution ships
+        # Agent 1 as authenticationmode 1 (None), which is why a freshly imported
+        # agent shows "No authentication". Rewrite it before packing so the
+        # import lands on the mode the caller asked for.
+        if ($SetAuth -ne 'Unchanged') {
+            if (-not $BotSchema) { throw '-AuthMode needs -Bot, so the script knows which agent in the package to change.' }
+            $botXml = Join-Path $work "bots\$BotSchema\bot.xml"
+            if (-not (Test-Path -LiteralPath $botXml)) {
+                throw "-AuthMode was asked for but the package has no bots\$BotSchema\bot.xml. Check the -Bot schema name."
+            }
+            $before = Get-Content -LiteralPath $botXml -Raw
+            Set-Content -LiteralPath $botXml -Value (Set-BotAuthXml -Xml $before -To $SetAuth) -Encoding utf8NoBOM
+            $was = if ($before -match '<authenticationmode>\s*(\d+)\s*</authenticationmode>') { $Matches[1] } else { '?' }
+            $changes.Add("auth: $BotSchema authenticationmode $was -> $($AuthModeValue[$SetAuth]) ($SetAuth)")
+        }
+
         if (Test-Path -LiteralPath $Out) { Remove-Item -LiteralPath $Out -Force }
         & $pac solution pack --zipfile $Out --folder $work --packagetype $PackType
         if ($LASTEXITCODE -ne 0) { throw "pac solution pack failed (exit $LASTEXITCODE)" }
@@ -674,9 +760,8 @@ if ($doSolution) {
     if (-not $SharePointUrl) {
         $SharePointUrl = Read-Host 'SharePoint site URL  (e.g. https://contoso.sharepoint.com/sites/AICOE)'
     }
-    if (-not $PSBoundParameters.ContainsKey('OrgUrl')) {
-        $answer = Read-Host "Dataverse org URL    (ENTER for $OrgUrl)"
-        if ($answer.Trim()) { $OrgUrl = $answer }
+    if (-not $OrgUrl) {
+        $OrgUrl = Read-Host 'Dataverse org URL    (e.g. https://org12345.crm.dynamics.com)'
     }
 
     $SharePointUrl = $SharePointUrl.Trim().TrimEnd('/')
@@ -694,9 +779,45 @@ if ($doSolution) {
         $OutFile = Join-Path (Split-Path -Parent $src) "${base}_Changed.zip"
     }
 
+    # Graph is app-only: client id + secret, never az. The secret comes from
+    # -ClientSecret, else GRAPH_CLIENT_SECRET, else a masked prompt, so it is
+    # never placed on a command line by this script.
+    $graphToken = $null
+    if ($ResolveLibraryId) {
+        if (-not $ClientId) { $ClientId = Read-Required 'Graph app registration client id' }
+        if (-not $TenantId) { $TenantId = Read-Required 'Tenant id' }
+        if (-not $ClientSecret) {
+            $ClientSecret = $env:GRAPH_CLIENT_SECRET
+            if ($ClientSecret) { Write-Host '  secret from GRAPH_CLIENT_SECRET' }
+        }
+        if (-not $ClientSecret) {
+            $sec = Read-Host 'Client secret VALUE (input hidden)' -AsSecureString
+            $ClientSecret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
+                                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+        }
+        if (-not $ClientSecret) { throw 'No client secret supplied, and -ResolveLibraryId needs one.' }
+        $graphToken = Get-GraphTokenAppOnly -Tenant $TenantId -App $ClientId -Secret $ClientSecret
+        Write-Host "  graph token acquired app-only for $ClientId"
+    }
+
     Invoke-SolutionStage -SrcZip $src -SiteUrl $SharePointUrl -DataverseUrl $OrgUrl -Out $OutFile `
                          -PackMode $Mode -PackType $PackageType -DoResolveLibrary ([bool]$ResolveLibraryId) `
-                         -LibraryName $Library -KeepAt $KeepSource
+                         -LibraryName $Library -KeepAt $KeepSource -GraphToken $graphToken `
+                         -BotSchema $Bot -SetAuth $AuthMode
+
+    if (-not $doImport) {
+        Write-Stage 'Import skipped (-SkipImport)'
+    } else {
+        Write-Stage "Import into $OrgUrl"
+        $pacImport = Resolve-Pac
+        # pac.cmd swallows exit codes, so treat "Error:" in the output as failure too.
+        $out = & $pacImport solution import --environment $OrgUrl --path $OutFile `
+                    --publish-changes --force-overwrite --activate-plugins --max-async-wait-time 60 2>&1 | ForEach-Object { "$_" }
+        $out | ForEach-Object { Write-Host "  $_" }
+        if ($LASTEXITCODE -ne 0 -or ($out -match '^\s*Error:')) {
+            throw "Solution import failed. The packed solution is at $OutFile - check 'pac auth list' and import from the portal if needed."
+        }
+    }
 }
 
 # ==============================================================================
@@ -734,12 +855,25 @@ function Get-SharedPrincipals {
     (Invoke-Dv ("RetrieveSharedPrincipalsAndAccess(Target=@t)?@t=" + [uri]::EscapeDataString(($Target | ConvertTo-Json -Compress)))).PrincipalAccesses
 }
 
-$row = (Invoke-Dv "bots?`$select=botid,name,accesscontrolpolicy,authorizedsecuritygroupids,publishedon&`$filter=schemaname eq '$Bot'").value
+$row = (Invoke-Dv "bots?`$select=botid,name,accesscontrolpolicy,authorizedsecuritygroupids,publishedon,authenticationmode,authenticationtrigger&`$filter=schemaname eq '$Bot'").value
 if (-not $row)        { throw "No agent with schema name '$Bot' in $OrgUrl. Schema name, not display name." }
 if ($row.Count -gt 1) { throw "'$Bot' matched $($row.Count) agents." }
 Write-Host "$($row.name) [$Bot]"
 Write-Host "  policy      $($row.accesscontrolpolicy) $($PolicyName[[int]$row.accesscontrolpolicy])  $($row.authorizedsecuritygroupids)"
 Write-Host "  publishedon $($row.publishedon)"
+Write-Host "  auth        $($row.authenticationmode) $($AuthName[[int]$row.authenticationmode])"
+
+# Also set it on the live row. Covers "after it is already imported", and is a
+# no-op when the package rewrite above already produced this value.
+if ($AuthMode -ne 'Unchanged' -and [int]$row.authenticationmode -ne $AuthModeValue[$AuthMode]) {
+    Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{
+        authenticationmode    = $AuthModeValue[$AuthMode]
+        authenticationtrigger = $(if ($AuthMode -eq 'Microsoft') { 1 } else { 0 })
+    } | Out-Null
+    $now = (Invoke-Dv "bots($($row.botid))?`$select=authenticationmode").authenticationmode
+    if ([int]$now -ne $AuthModeValue[$AuthMode]) { throw "Authentication did not stick: still $now" }
+    Write-Host "  auth        set to $now $($AuthName[[int]$now])"
+}
 
 $target = @{ '@odata.id' = "bots($($row.botid))" }
 
