@@ -66,13 +66,28 @@ param(
     [ValidateSet('Unchanged', 'Microsoft', 'None')]
     [string] $AuthMode = 'Unchanged',
 
+    # Which agents -AuthMode applies to. Separate from -Bot on purpose: -Bot is the
+    # list to share and publish, which is usually every agent, while authentication
+    # normally should change on only one of them. Defaults to -Bot when that names
+    # a single agent.
+    [string[]] $AuthBot,
+
+    # --- Fno credentials -------------------------------------------------------
+    # Key Vault secret REFERENCES, not secrets. Defaults are the demo vault; pass
+    # your own to point the solution somewhere else. -SkipFno leaves them alone.
+    [string] $FnoUsernameValue = '/subscriptions/0c33fa37-4fa1-466d-a891-46af9e2f6e44/resourceGroups/DemoResourceGroup/providers/Microsoft.KeyVault/vaults/CUA-vault-key/secrets/Fno-Usernames',
+    [string] $FnoPasswordValue = '/subscriptions/0c33fa37-4fa1-466d-a891-46af9e2f6e44/resourceGroups/DemoResourceGroup/providers/Microsoft.KeyVault/vaults/CUA-vault-key/secrets/fno-password',
+    [switch] $SkipFno,
+
     # --- Graph app-only credentials, only needed by -ResolveLibraryId ----------
     [string] $ClientId,
     [string] $TenantId,
     [string] $ClientSecret,
 
     # --- agent -----------------------------------------------------------------
-    [string] $Bot,
+    # One or more agent SCHEMA names. Left empty, every agent found in the packed
+    # solution is used, so a package carrying Agent 1 and Agent 2 does both.
+    [string[]] $Bot,
     [string] $UserEmail,
     [string] $RevokeUserEmail,
     [switch] $Everyone,
@@ -91,6 +106,24 @@ $EvOrg        = 'cre44_DataverseOrgUrl'
 $EvLibrary    = 'cre44_SharePointLibraryId'
 
 $PolicyName = @{ 0 = 'Any (everyone in org)'; 1 = 'Copilot readers (shared principals only)'; 2 = 'Group membership'; 3 = 'Any (multi-tenant)' }
+
+# Windows PowerShell 5.1 has no 'utf8NoBOM' encoding - that name only exists in
+# PowerShell 6+. A BOM in the solution's XML/JSON makes `pac solution pack` and the
+# import choke, so write UTF-8 without one through .NET, which behaves the same on
+# both. Set-Content appended a trailing newline, so this does too, keeping the
+# packed output byte-identical to what the PowerShell 7 runs produced.
+function Set-Utf8NoBom {
+    param([string] $LiteralPath, [string] $Value)
+    [System.IO.File]::WriteAllText($LiteralPath, $Value + [Environment]::NewLine,
+                                   (New-Object System.Text.UTF8Encoding $false))
+}
+
+# 5.1 still negotiates TLS 1.0/1.1 by default on some builds; the download endpoints
+# require 1.2.
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
 
 function Write-Stage { param([string] $Text) Write-Host "`n=== $Text" -ForegroundColor Cyan }
 
@@ -135,7 +168,11 @@ SOLUTION OPTIONS
                            import overwrites the target. This solution ships
                            Agent 1 as None, which is why a freshly imported
                            agent shows "No authentication". Microsoft rewrites
-                           the package AND the live agent. Needs -Bot.
+                           the package AND the live agent.
+  -AuthBot <schemaname>    which agent(s) -AuthMode applies to. Defaults to -Bot
+                           when that names one agent; required when it names
+                           several. Keep Custom Entra agents out of this list -
+                           switching them discards their connection.
   -Mode literal|envvar     literal writes values in; envvar exposes them as
                            environment variables. Default literal.
   -PackageType <t>         Unmanaged (default), Managed or Both
@@ -280,6 +317,54 @@ function Resolve-SharePointLibraryId {
 }
 
 # ==============================================================================
+# Fno credentials - merged from Set-FnoEnvVars.ps1
+# ==============================================================================
+
+# Dataverse rejects a secret-type value that does not match this. Anchored, so
+# trailing junk fails here instead of at import time with the useless message
+# "This variable didn't save properly."
+$SecretRefPattern = '(?i)^/subscriptions/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/resourcegroups/(.+?)/providers/Microsoft\.KeyVault/(.+?)/secrets/(.+)$'
+$SecretRefHint    = 'Valid format: /subscriptions/<guid>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<vault>/secrets/<secret>'
+
+# Point one environmentvariabledefinition.xml at its secret, if it is an Fno one.
+# Returns $null for every other variable, which is how callers know to skip it.
+# Publisher prefix is matched dynamically - only the suffix is fixed.
+function Set-FnoEnvVar {
+    param([string] $LiteralPath, [string] $UsernameValue, [string] $PasswordValue)
+
+    $xml = New-Object System.Xml.XmlDocument
+    $xml.Load((Resolve-Path -LiteralPath $LiteralPath))
+    $def    = $xml.DocumentElement
+    $schema = $def.GetAttribute('schemaname')
+
+    $value = switch -Regex ($schema) {
+        '_FnoUsername$' { $UsernameValue; break }
+        '_FnoPassword$' { $PasswordValue; break }
+        default { return $null }
+    }
+
+    $node = $def.SelectSingleNode('defaultvalue')
+    if (-not $node) {
+        $node = $xml.CreateElement('defaultvalue')
+        [void]$def.InsertBefore($node, $def.FirstChild)
+    }
+    $old = $node.InnerText
+    $node.InnerText = $value
+
+    # Save through an XmlWriter pinned to UTF-8 without a BOM. Not $xml.Save(path),
+    # which emits a BOM, and emphatically not $xml.Save(StringWriter), which stamps
+    # the declaration encoding="utf-16" from the writer and makes pac fail with
+    # "There is no Unicode byte order mark. Cannot switch to Unicode."
+    $settings = New-Object System.Xml.XmlWriterSettings
+    $settings.Encoding = New-Object System.Text.UTF8Encoding $false
+    $settings.Indent   = $true
+    $w = [System.Xml.XmlWriter]::Create($LiteralPath, $settings)
+    try { $xml.Save($w) } finally { $w.Dispose() }
+
+    [pscustomobject]@{ SchemaName = $schema; OldValue = $old; NewValue = $value }
+}
+
+# ==============================================================================
 # authentication
 # ==============================================================================
 
@@ -375,6 +460,42 @@ if ($SelfTest) {
     if ($m -match 'connectionName')                                      { throw 'selftest: switching auth should drop the Entra connectionName' }
     if ($m -notmatch '\$kind')                                           { throw 'selftest: the config blob must keep its $kind' }
     if ($m -notmatch '<iconbase64>AAAA</iconbase64>')                    { throw 'selftest: auth rewrite must not touch anything else' }
+    # Fno: the secret-reference pattern, and the variable rewriter
+    if ($FnoUsernameValue -notmatch $SecretRefPattern) { throw 'selftest: the default Fno username is not a valid secret reference' }
+    if ($FnoPasswordValue -notmatch $SecretRefPattern) { throw 'selftest: the default Fno password is not a valid secret reference' }
+    foreach ($bad in @(
+            'not-a-path',
+            '/subscriptions/nope/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/kv/secrets/sec',
+            '/subscriptions/0c33fa37-4fa1-466d-a891-46af9e2f6e44/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/kv/sec',
+            'https://kv.vault.azure.net/secrets/sec')) {
+        if ($bad -match $SecretRefPattern) { throw "selftest: secret pattern wrongly accepted '$bad'" }
+    }
+    $fd = Join-Path ([IO.Path]::GetTempPath()) ("fno_" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $fd -Force | Out-Null
+    try {
+        # existing value replaced; a different publisher prefix still matches
+        $fa = Join-Path $fd 'a.xml'
+        Set-Content -LiteralPath $fa -Value '<environmentvariabledefinition schemaname="abc12_FnoUsername"><defaultvalue>stale</defaultvalue><type>100000005</type></environmentvariabledefinition>'
+        # no defaultvalue at all -> inserted
+        $fb = Join-Path $fd 'b.xml'
+        Set-Content -LiteralPath $fb -Value '<environmentvariabledefinition schemaname="abc12_FnoPassword"><type>100000005</type></environmentvariabledefinition>'
+        # unrelated variable -> untouched
+        $fc = Join-Path $fd 'c.xml'
+        Set-Content -LiteralPath $fc -Value '<environmentvariabledefinition schemaname="abc12_ApiUrl"><defaultvalue>keepme</defaultvalue></environmentvariabledefinition>'
+
+        $ra = Set-FnoEnvVar -LiteralPath $fa -UsernameValue 'U' -PasswordValue 'P'
+        $rb = Set-FnoEnvVar -LiteralPath $fb -UsernameValue 'U' -PasswordValue 'P'
+        $rc = Set-FnoEnvVar -LiteralPath $fc -UsernameValue 'U' -PasswordValue 'P'
+        if ($ra.OldValue -ne 'stale') { throw 'selftest: fno existing value not read' }
+        if (([xml](Get-Content -LiteralPath $fa -Raw)).environmentvariabledefinition.defaultvalue -ne 'U') { throw 'selftest: fno username not replaced' }
+        if (([xml](Get-Content -LiteralPath $fb -Raw)).environmentvariabledefinition.defaultvalue -ne 'P') { throw 'selftest: fno password not inserted' }
+        if (([xml](Get-Content -LiteralPath $fc -Raw)).environmentvariabledefinition.defaultvalue -ne 'keepme') { throw 'selftest: fno touched an unrelated variable' }
+        if ($null -ne $rc) { throw 'selftest: fno reported an unrelated variable as changed' }
+        # and the file it wrote must have no BOM
+        $bytes = [System.IO.File]::ReadAllBytes($fa)
+        if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { throw 'selftest: fno wrote a BOM' }
+    } finally { Remove-Item -LiteralPath $fd -Recurse -Force -ErrorAction SilentlyContinue }
+
     $nn = Set-BotAuthXml -Xml $sample -To None
     if ($nn -notmatch '<authenticationmode>1</authenticationmode>')       { throw 'selftest: auth None should set mode 1' }
     if ($nn -notmatch '<authenticationtrigger>0</authenticationtrigger>') { throw 'selftest: auth None should set trigger As Needed' }
@@ -407,7 +528,7 @@ if ($SolutionUrl) {
     New-Item -ItemType Directory -Path $fetchDir -Force | Out-Null
     $Path = Join-Path $fetchDir 'solution.zip'
     Write-Stage "Fetch $SolutionUrl"
-    Invoke-WebRequest -Uri $SolutionUrl -OutFile $Path -MaximumRedirection 5
+    Invoke-WebRequest -Uri $SolutionUrl -OutFile $Path -MaximumRedirection 5 -UseBasicParsing
 }
 elseif ($SolutionPath) {
     if (-not (Test-Path -LiteralPath $SolutionPath -PathType Leaf)) { throw "Not a file: $SolutionPath" }
@@ -428,8 +549,26 @@ $doAgent    = (-not $NoShare) -and (($modes.Count -gt 0) -or (-not $doSolution) 
 # agent stage dereferences $OrgUrl unconditionally and would fault on $null.
 $OrgUrl = if ($EnvironmentUrl) { Resolve-EnvironmentUrl $EnvironmentUrl } else { $null }
 if (($doAgent -or $doImport) -and -not $OrgUrl) { throw 'Pass -EnvironmentUrl (org URL or environment GUID).' }
-if ($doAgent -and -not $Bot) { $Bot = Read-Required 'Agent schema name    (e.g. cr720_Agent1TestScript, NOT the display name)' }
-if ($AuthMode -ne 'Unchanged' -and -not $Bot) { $Bot = Read-Required 'Agent schema name    (-AuthMode needs to know which agent)' }
+# Only ask up front when no solution is being unpacked. With a package, the agent
+# names come from what it actually carries, which is decided after the unpack.
+if ($doAgent -and -not $doSolution -and -not $Bot) {
+    $Bot = @(Read-Required 'Agent schema name    (e.g. cr720_Agent1TestScript, NOT the display name)')
+}
+# -AuthMode is deliberately NOT applied to every agent by default: switching an
+# agent off Custom Entra discards its connection, and Agent 2 uses it. So it falls
+# back to -Bot only when that is unambiguous, and otherwise insists on -AuthBot.
+$AuthBot = @($AuthBot | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($AuthMode -ne 'Unchanged' -and -not $AuthBot) {
+    $named = @($Bot | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($named.Count -eq 1) {
+        $AuthBot = $named
+    } elseif ($named.Count -gt 1) {
+        throw ("-Bot names $($named.Count) agents, so -AuthMode is ambiguous. Pass -AuthBot with just the agent whose " +
+               "authentication should change. Changing an agent that uses Custom Entra discards its connection.")
+    } else {
+        throw '-AuthMode needs -AuthBot naming the agent whose authentication should change.'
+    }
+}
 
 
 
@@ -479,7 +618,8 @@ function Invoke-SolutionStage {
     param(
         [string] $SrcZip, [string] $SiteUrl, [string] $DataverseUrl, [string] $Out,
         [string] $PackMode, [string] $PackType, [bool] $DoResolveLibrary, [string] $LibraryName,
-        [string] $KeepAt, [string] $GraphToken, [string] $BotSchema, [string] $SetAuth
+        [string] $KeepAt, [string] $GraphToken, [string[]] $BotSchema, [string] $SetAuth,
+        [bool] $DoFno, [string] $FnoUser, [string] $FnoPass
     )
     # The original script ran under StrictMode; keep that scoped to this stage so
     # the agent stage behaves exactly as it did before the merge.
@@ -497,6 +637,12 @@ function Invoke-SolutionStage {
         & $pac solution unpack --zipfile $SrcZip --folder $work --packagetype $PackType
         if ($LASTEXITCODE -ne 0) { throw "pac solution unpack failed (exit $LASTEXITCODE)" }
         Write-Host "unpacked $((Get-ChildItem -LiteralPath $work -Recurse -File).Count) files"
+
+        # What the package actually contains decides which agents get shared later,
+        # so nothing has to hardcode an agent name.
+        $script:PackagedBots = @(Get-ChildItem -LiteralPath (Join-Path $work 'bots') -Directory |
+                                 Select-Object -ExpandProperty Name)
+        Write-Host "agents in package: $($script:PackagedBots -join ', ')"
 
         $flow = @(Get-ChildItem -LiteralPath (Join-Path $work 'Workflows') -Filter 'Save-Generated-CSV-To-SharePoint-*.json' -File)
         if ($flow.Count -ne 1) { throw "Expected exactly one Agent-1 CSV flow, found $($flow.Count)" }
@@ -575,7 +721,7 @@ function Invoke-SolutionStage {
             }
         }
 
-        ($json | ConvertTo-Json -Depth 100) | Set-Content -LiteralPath $flowPath -Encoding utf8NoBOM
+        Set-Utf8NoBom -LiteralPath $flowPath -Value ($json | ConvertTo-Json -Depth 100)
         $changes.Add("flow: set $n SharePoint site value(s) in $($flow[0].Name)")
 
         $tools = @(
@@ -624,7 +770,7 @@ function Invoke-SolutionStage {
   <type>100000000</type>
 </environmentvariabledefinition>
 "@
-                Set-Content -LiteralPath (Join-Path $dir 'environmentvariabledefinition.xml') -Value $xml -Encoding utf8NoBOM
+                Set-Utf8NoBom -LiteralPath (Join-Path $dir 'environmentvariabledefinition.xml') -Value $xml
                 $changes.Add("env var: defined $($d.Name)")
             }
 
@@ -635,7 +781,7 @@ function Invoke-SolutionStage {
             # (the 1_0_0_8 lineage is like this), so start one.
             if ($evLinks.Count -and -not (Test-Path -LiteralPath $linkFile)) {
                 New-Item -ItemType Directory -Path (Split-Path -Parent $linkFile) -Force | Out-Null
-                Set-Content -LiteralPath $linkFile -Encoding utf8NoBOM `
+                Set-Utf8NoBom -LiteralPath $linkFile `
                     -Value "<botcomponent_environmentvariabledefinitionset>`n</botcomponent_environmentvariabledefinitionset>"
                 $changes.Add('env var: created the botcomponent link file (none existed)')
             }
@@ -650,7 +796,7 @@ function Invoke-SolutionStage {
                 }
                 if ($rows) {
                     $x = $x -replace '</botcomponent_environmentvariabledefinitionset>', ($rows + '</botcomponent_environmentvariabledefinitionset>')
-                    Set-Content -LiteralPath $linkFile -Value $x -Encoding utf8NoBOM
+                    Set-Utf8NoBom -LiteralPath $linkFile -Value $x
                     $changes.Add("env var: linked $($evLinks.Count) agent tool(s)")
                 }
             }
@@ -702,7 +848,7 @@ function Invoke-SolutionStage {
                     $lx = Get-Content -LiteralPath $dvLink -Raw
                     $nx = [regex]::Replace($lx,
                         '(?is)\s*<botcomponent_dvtablesearch[^>]*' + [regex]::Escape($searchId) + '.*?</botcomponent_dvtablesearch>', '')
-                    if ($nx -ne $lx) { Set-Content -LiteralPath $dvLink -Value $nx -Encoding utf8NoBOM }
+                    if ($nx -ne $lx) { Set-Utf8NoBom -LiteralPath $dvLink -Value $nx }
                 }
 
                 $changes.Add("import fix: removed search config for missing app '$app'")
@@ -718,19 +864,86 @@ function Invoke-SolutionStage {
         # import lands on the mode the caller asked for.
         if ($SetAuth -ne 'Unchanged') {
             if (-not $BotSchema) { throw '-AuthMode needs -Bot, so the script knows which agent in the package to change.' }
-            $botXml = Join-Path $work "bots\$BotSchema\bot.xml"
-            if (-not (Test-Path -LiteralPath $botXml)) {
-                throw "-AuthMode was asked for but the package has no bots\$BotSchema\bot.xml. Check the -Bot schema name."
+            foreach ($bs in $BotSchema) {
+                $botXml = Join-Path $work "bots\$bs\bot.xml"
+                if (-not (Test-Path -LiteralPath $botXml)) {
+                    throw "-AuthMode was asked for but the package has no bots\$bs\bot.xml. Check the -Bot schema name."
+                }
+                $before = Get-Content -LiteralPath $botXml -Raw
+                $was = if ($before -match '<authenticationmode>\s*(\d+)\s*</authenticationmode>') { $Matches[1] } else { '?' }
+                # Mode 3 is Custom Entra, whose config carries a connectionName that
+                # switching away from it discards. Worth saying out loud.
+                if ($was -eq '3' -and $SetAuth -ne 'None') {
+                    $warnings.Add("auth: $bs was Custom Entra - its connectionName is being dropped. Pass only the agents you mean to change.")
+                }
+                Set-Utf8NoBom -LiteralPath $botXml -Value (Set-BotAuthXml -Xml $before -To $SetAuth)
+                $changes.Add("auth: $bs authenticationmode $was -> $($AuthModeValue[$SetAuth]) ($SetAuth)")
             }
-            $before = Get-Content -LiteralPath $botXml -Raw
-            Set-Content -LiteralPath $botXml -Value (Set-BotAuthXml -Xml $before -To $SetAuth) -Encoding utf8NoBOM
-            $was = if ($before -match '<authenticationmode>\s*(\d+)\s*</authenticationmode>') { $Matches[1] } else { '?' }
-            $changes.Add("auth: $BotSchema authenticationmode $was -> $($AuthModeValue[$SetAuth]) ($SetAuth)")
+        }
+
+        # --- Fno credentials, merged from Set-FnoEnvVars.ps1 ------------------
+        # These are Key Vault secret REFERENCES; no secret value is written here.
+        if ($DoFno) {
+            $manifest = Join-Path $work 'Other\Solution.xml'
+            if (-not (Test-Path -LiteralPath $manifest)) {
+                throw "Unpacked solution has no Other\Solution.xml, so the publisher prefix cannot be read."
+            }
+            $prefix = $null
+            foreach ($name in 'FnoUsername', 'FnoPassword') {
+                $existing = Get-ChildItem -LiteralPath $work -Recurse -Filter 'environmentvariabledefinition.xml' -File |
+                    Where-Object { ([xml](Get-Content -LiteralPath $_.FullName -Raw)).environmentvariabledefinition.schemaname -match "_$name$" }
+                if ($existing) { continue }
+
+                if (-not $prefix) {
+                    $prefix = ([xml](Get-Content -LiteralPath $manifest -Raw)).SelectSingleNode('//CustomizationPrefix').InnerText
+                    if (-not $prefix) { throw 'Solution.xml has no CustomizationPrefix, so the Fno variables cannot be named.' }
+                }
+                $schema = "${prefix}_$name"
+                $dir    = Join-Path (Join-Path $work 'environmentvariabledefinitions') $schema
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+                $evXml = @"
+<environmentvariabledefinition schemaname="$schema">
+  <displayname default="$name">
+    <label description="$name" languagecode="1033" />
+  </displayname>
+  <introducedversion>1.0.0.0</introducedversion>
+  <iscustomizable>1</iscustomizable>
+  <isrequired>0</isrequired>
+  <secretstore>0</secretstore>
+  <type>100000005</type>
+</environmentvariabledefinition>
+"@
+                Set-Utf8NoBom -LiteralPath (Join-Path $dir 'environmentvariabledefinition.xml') -Value $evXml
+
+                # Writing the file is not enough. A component that is not listed in
+                # Solution.xml RootComponents is carried in the zip and then ignored
+                # by the import. 380 is Environment Variable Definition.
+                $sx = Get-Content -LiteralPath $manifest -Raw
+                if ($sx -notmatch [regex]::Escape("schemaName=`"$schema`"")) {
+                    $sx = $sx -replace '(\s*)</RootComponents>',
+                                       "`$1  <RootComponent type=`"380`" schemaName=`"$schema`" behavior=`"0`" />`$1</RootComponents>"
+                    Set-Utf8NoBom -LiteralPath $manifest -Value $sx.TrimEnd()
+                }
+                $changes.Add("fno: created $schema and registered it in the solution")
+            }
+
+            $touched = @(Get-ChildItem -LiteralPath $work -Recurse -Filter 'environmentvariabledefinition.xml' -File |
+                         ForEach-Object { Set-FnoEnvVar -LiteralPath $_.FullName -UsernameValue $FnoUser -PasswordValue $FnoPass })
+            if (-not $touched) { $warnings.Add('fno: no Fno username/password variables found or created') }
+            foreach ($t in $touched) { $changes.Add("fno: $($t.SchemaName) -> $($t.NewValue)") }
         }
 
         if (Test-Path -LiteralPath $Out) { Remove-Item -LiteralPath $Out -Force }
         & $pac solution pack --zipfile $Out --folder $work --packagetype $PackType
         if ($LASTEXITCODE -ne 0) { throw "pac solution pack failed (exit $LASTEXITCODE)" }
+        # pac.cmd does not propagate exit codes, so a failed pack returns 0 and the
+        # run would carry on and "import" a file that was never written. The zip
+        # existing is the only honest proof. Long paths are the usual cause: pac is
+        # still limited to 260 characters for the zip and everything under -KeepSource.
+        if (-not (Test-Path -LiteralPath $Out)) {
+            throw ("pac solution pack reported success but $Out does not exist. " +
+                   "Check the output above - a path over 260 characters is the usual cause.")
+        }
 
         Write-Host ''
         $changes  | ForEach-Object { Write-Host "  - $_" }
@@ -763,6 +976,10 @@ if ($doSolution) {
     if (-not $OrgUrl) {
         $OrgUrl = Read-Host 'Dataverse org URL    (e.g. https://org12345.crm.dynamics.com)'
     }
+    # Read-Host returns empty when there is no console, so a non-interactive run
+    # that forgot one of these would otherwise die on a null method call below.
+    if (-not $SharePointUrl) { throw 'No SharePoint site URL. Pass -SharePointUrl when running non-interactively.' }
+    if (-not $OrgUrl)        { throw 'No environment. Pass -EnvironmentUrl when running non-interactively.' }
 
     $SharePointUrl = $SharePointUrl.Trim().TrimEnd('/')
     $OrgUrl        = $OrgUrl.Trim().TrimEnd('/')
@@ -777,6 +994,17 @@ if ($doSolution) {
     if (-not $OutFile) {
         $base    = [IO.Path]::GetFileNameWithoutExtension($src)
         $OutFile = Join-Path (Split-Path -Parent $src) "${base}_Changed.zip"
+    }
+
+    # Fail before unpacking anything if the secret references are malformed.
+    # Dataverse otherwise accepts the import and reports "This variable didn't
+    # save properly" with no clue which value was wrong.
+    if (-not $SkipFno) {
+        foreach ($v in @{ Username = $FnoUsernameValue; Password = $FnoPasswordValue }.GetEnumerator()) {
+            if ($v.Value -notmatch $SecretRefPattern) {
+                throw "Fno $($v.Key) is not a valid Key Vault secret reference: $($v.Value)`n$SecretRefHint"
+            }
+        }
     }
 
     # Graph is app-only: client id + secret, never az. The secret comes from
@@ -803,7 +1031,8 @@ if ($doSolution) {
     Invoke-SolutionStage -SrcZip $src -SiteUrl $SharePointUrl -DataverseUrl $OrgUrl -Out $OutFile `
                          -PackMode $Mode -PackType $PackageType -DoResolveLibrary ([bool]$ResolveLibraryId) `
                          -LibraryName $Library -KeepAt $KeepSource -GraphToken $graphToken `
-                         -BotSchema $Bot -SetAuth $AuthMode
+                         -BotSchema $AuthBot -SetAuth $AuthMode `
+                         -DoFno (-not $SkipFno) -FnoUser $FnoUsernameValue -FnoPass $FnoPasswordValue
 
     if (-not $doImport) {
         Write-Stage 'Import skipped (-SkipImport)'
@@ -826,6 +1055,18 @@ if ($doSolution) {
 
 if (-not $doAgent) { return }
 Write-Stage 'Agent: sharing'
+
+# Left unspecified, share every agent the package carried - that is how Agent 2
+# gets shared and published alongside Agent 1 without either name being hardcoded.
+if (-not $Bot -and $script:PackagedBots) {
+    $Bot = $script:PackagedBots
+    Write-Host "agents: $($Bot -join ', ')  (all agents in the package)"
+}
+if (-not $Bot) { $Bot = @(Read-Required 'Agent schema name    (e.g. cr720_Agent1TestScript, NOT the display name)') }
+
+# "pwsh -File script.ps1 -Bot a,b" hands the whole thing over as ONE string, unlike
+# a normal call from a prompt, so split on commas to make both invocations behave.
+$Bot = @($Bot | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
 $OrgUrl = $OrgUrl.Trim().TrimEnd('/')
 $token = az account get-access-token --resource $OrgUrl --query accessToken -o tsv
@@ -855,145 +1096,172 @@ function Get-SharedPrincipals {
     (Invoke-Dv ("RetrieveSharedPrincipalsAndAccess(Target=@t)?@t=" + [uri]::EscapeDataString(($Target | ConvertTo-Json -Compress)))).PrincipalAccesses
 }
 
-$row = (Invoke-Dv "bots?`$select=botid,name,accesscontrolpolicy,authorizedsecuritygroupids,publishedon,authenticationmode,authenticationtrigger&`$filter=schemaname eq '$Bot'").value
-if (-not $row)        { throw "No agent with schema name '$Bot' in $OrgUrl. Schema name, not display name." }
-if ($row.Count -gt 1) { throw "'$Bot' matched $($row.Count) agents." }
-Write-Host "$($row.name) [$Bot]"
-Write-Host "  policy      $($row.accesscontrolpolicy) $($PolicyName[[int]$row.accesscontrolpolicy])  $($row.authorizedsecuritygroupids)"
-Write-Host "  publishedon $($row.publishedon)"
-Write-Host "  auth        $($row.authenticationmode) $($AuthName[[int]$row.authenticationmode])"
+# Everything below runs once per agent named in -Bot, so a solution carrying more
+# than one agent gets each of them shared and published in the same run.
+function Invoke-AgentStage {
+    param([Parameter(Mandatory)][string] $Bot)
+    Write-Host ""
+    $row = (Invoke-Dv "bots?`$select=botid,name,accesscontrolpolicy,authorizedsecuritygroupids,publishedon,authenticationmode,authenticationtrigger&`$filter=schemaname eq '$Bot'").value
+    if (-not $row)        { throw "No agent with schema name '$Bot' in $OrgUrl. Schema name, not display name." }
+    if ($row.Count -gt 1) { throw "'$Bot' matched $($row.Count) agents." }
+    Write-Host "$($row.name) [$Bot]"
+    Write-Host "  policy      $($row.accesscontrolpolicy) $($PolicyName[[int]$row.accesscontrolpolicy])  $($row.authorizedsecuritygroupids)"
+    Write-Host "  publishedon $($row.publishedon)"
+    Write-Host "  auth        $($row.authenticationmode) $($AuthName[[int]$row.authenticationmode])"
 
-# Also set it on the live row. Covers "after it is already imported", and is a
-# no-op when the package rewrite above already produced this value.
-if ($AuthMode -ne 'Unchanged' -and [int]$row.authenticationmode -ne $AuthModeValue[$AuthMode]) {
-    Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{
-        authenticationmode    = $AuthModeValue[$AuthMode]
-        authenticationtrigger = $(if ($AuthMode -eq 'Microsoft') { 1 } else { 0 })
-    } | Out-Null
-    $now = (Invoke-Dv "bots($($row.botid))?`$select=authenticationmode").authenticationmode
-    if ([int]$now -ne $AuthModeValue[$AuthMode]) { throw "Authentication did not stick: still $now" }
-    Write-Host "  auth        set to $now $($AuthName[[int]$now])"
-}
-
-$target = @{ '@odata.id' = "bots($($row.botid))" }
-
-if ($modes.Count -eq 0) {
-    Write-Host "  shared with"
-    foreach ($p in Get-SharedPrincipals $target) {
-        $id   = $p.Principal.ownerid
-        $type = $p.Principal.'@odata.type' -replace '.*\.', ''
-        $who  = if ($type -eq 'systemuser') { (Invoke-Dv "systemusers($id)?`$select=domainname").domainname }
-                else { "$((Invoke-Dv "teams($id)?`$select=name").name) (team)" }
-        Write-Host "    $who - $($p.AccessMask)"
-    }
-    return
-}
-
-if ($Everyone) {
-    Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{ accesscontrolpolicy = 0; authorizedsecuritygroupids = $null } | Out-Null
-    Write-Host "Policy set to 0 $($PolicyName[0])."
-}
-
-if ($RevokeEveryone) {
-    # The mirror of -Everyone: withdraw the org-wide grant by moving the policy to
-    # Copilot readers. Individual row shares survive on purpose - they are separate
-    # grants, and clearing them is -RevokeUserEmail's job, one user at a time.
-    Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{ accesscontrolpolicy = 1; authorizedsecuritygroupids = $null } | Out-Null
-    Write-Host "Org-wide access withdrawn. Policy set to 1 $($PolicyName[1])."
-    $left = Get-SharedPrincipals $target | Where-Object { $_.Principal.'@odata.type' -match 'systemuser' }
-    if ($left) {
-        Write-Host "  these users keep access through an individual share:"
-        foreach ($p in $left) { Write-Host "    $((Invoke-Dv "systemusers($($p.Principal.ownerid))?`$select=domainname").domainname)" }
-        Write-Host "  clear each with -RevokeUserEmail, or leave them if they should keep it."
-    } else {
-        Write-Host "  no individual user shares remain - only the owner team can use the agent."
-    }
-}
-
-if ($UserEmail) {
-    $user = Resolve-DvUser $UserEmail
-    Write-Host "Share with: $($user.fullname) <$($user.domainname)>"
-
-    # 1. prvReadbot, the privilege that lets the user see the agent at all.
-    #    Only grant a role if none of theirs already carries it - Environment Maker
-    #    is environment-wide, and Bot Author / Bot Viewer / Agent Viewer carry it too.
-    $userRoles  = (Invoke-Dv "systemusers($($user.systemuserid))/systemuserroles_association?`$select=name,roleid").value
-    $prvReadBot = (Invoke-Dv "privileges?`$select=privilegeid&`$filter=name eq 'prvReadbot'").value[0].privilegeid
-    $holder     = $userRoles | Where-Object {
-        (Invoke-Dv "RetrieveRolePrivilegesRole(RoleId=$($_.roleid))").RolePrivileges.PrivilegeId -contains $prvReadBot
-    } | Select-Object -First 1
-    if ($holder) {
-        Write-Host "  role   $($holder.name) already carries prvReadbot"
-    } else {
-        $role = (Invoke-Dv ("roles?`$select=roleid&`$filter=name eq 'Environment Maker' and _businessunitid_value eq $($user._businessunitid_value)")).value
-        if (-not $role) { throw "No Environment Maker role in the user's business unit. Assign a role carrying prvReadbot by hand." }
-        Invoke-Dv "systemusers($($user.systemuserid))/systemuserroles_association/`$ref" -Method Post -Body @{ '@odata.id' = "$api/roles($($role[0].roleid))" } | Out-Null
-        Write-Host "  role   Environment Maker assigned - no existing role carried prvReadbot (had: $($userRoles.name -join ', '))"
+    # Also set it on the live row. Covers "after it is already imported", and is a
+    # no-op when the package rewrite above already produced this value.
+    if ($AuthMode -ne 'Unchanged' -and ($AuthBot -contains $Bot) -and [int]$row.authenticationmode -ne $AuthModeValue[$AuthMode]) {
+        Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{
+            authenticationmode    = $AuthModeValue[$AuthMode]
+            authenticationtrigger = $(if ($AuthMode -eq 'Microsoft') { 1 } else { 0 })
+        } | Out-Null
+        $now = (Invoke-Dv "bots($($row.botid))?`$select=authenticationmode").authenticationmode
+        if ([int]$now -ne $AuthModeValue[$AuthMode]) { throw "Authentication did not stick: still $now" }
+        Write-Host "  auth        set to $now $($AuthName[[int]$now])"
     }
 
-    # 2. Read access on the agent row.
-    Invoke-Dv 'GrantAccess' -Method Post -Body @{
-        Target          = $target
-        PrincipalAccess = @{ Principal = @{ '@odata.id' = "systemusers($($user.systemuserid))" }; AccessMask = 'ReadAccess' }
-    } | Out-Null
-    Write-Host "  share  ReadAccess granted on the agent"
+    $target = @{ '@odata.id' = "bots($($row.botid))" }
 
-    # 3. Policy, only if it would swallow the share.
-    $fix = Get-SharePolicyFix -Policy ([int]$row.accesscontrolpolicy) -Groups $row.authorizedsecuritygroupids
-    if ($fix.Warn) { Write-Warning $fix.Warn }
-    if ($null -ne $fix.Set) {
-        Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{ accesscontrolpolicy = $fix.Set } | Out-Null
-        Write-Host "  policy was 2 with no groups (nobody) - set to $($fix.Set) $($PolicyName[$fix.Set])"
-    } else {
-        Write-Host "  policy left at $($row.accesscontrolpolicy) $($PolicyName[[int]$row.accesscontrolpolicy])"
-    }
-}
-
-if ($RevokeUserEmail) {
-    $user = Resolve-DvUser $RevokeUserEmail
-    Write-Host "Revoke: $($user.fullname) <$($user.domainname)>"
-
-    # 1. Drop the row share, then prove it is gone.
-    Invoke-Dv 'RevokeAccess' -Method Post -Body @{
-        Target  = $target
-        Revokee = @{ '@odata.id' = "systemusers($($user.systemuserid))" }
-    } | Out-Null
-    $still = Get-SharedPrincipals $target | Where-Object { $_.Principal.ownerid -eq $user.systemuserid }
-    if ($still) { throw "RevokeAccess returned success but the share is still there: $($still.AccessMask)" }
-    Write-Host "  share  revoked on the agent"
-
-    # 2. Policy, if it would make the revoke meaningless.
-    $fix = Get-RevokePolicyFix -Policy ([int]$row.accesscontrolpolicy) -Groups $row.authorizedsecuritygroupids
-    if ($fix.Warn) { Write-Warning $fix.Warn }
-    if ($null -ne $fix.Set) {
-        Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{ accesscontrolpolicy = $fix.Set } | Out-Null
-        Write-Host "  policy narrowed to $($fix.Set) $($PolicyName[$fix.Set])"
-    } else {
-        Write-Host "  policy left at $($row.accesscontrolpolicy) $($PolicyName[[int]$row.accesscontrolpolicy])"
+    if ($modes.Count -eq 0) {
+        Write-Host "  shared with"
+        foreach ($p in Get-SharedPrincipals $target) {
+            $id   = $p.Principal.ownerid
+            $type = $p.Principal.'@odata.type' -replace '.*\.', ''
+            $who  = if ($type -eq 'systemuser') { (Invoke-Dv "systemusers($id)?`$select=domainname").domainname }
+                    else { "$((Invoke-Dv "teams($id)?`$select=name").name) (team)" }
+            Write-Host "    $who - $($p.AccessMask)"
+        }
+        return
     }
 
-    # The environment role is deliberately left alone - it governs every agent here, not this one.
-    Write-Host "  role   left as is. Environment Maker governs the whole environment, not this agent."
+    if ($Everyone) {
+        Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{ accesscontrolpolicy = 0; authorizedsecuritygroupids = $null } | Out-Null
+        Write-Host "Policy set to 0 $($PolicyName[0])."
+    }
+
+    if ($RevokeEveryone) {
+        # The mirror of -Everyone: withdraw the org-wide grant by moving the policy to
+        # Copilot readers. Individual row shares survive on purpose - they are separate
+        # grants, and clearing them is -RevokeUserEmail's job, one user at a time.
+        Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{ accesscontrolpolicy = 1; authorizedsecuritygroupids = $null } | Out-Null
+        Write-Host "Org-wide access withdrawn. Policy set to 1 $($PolicyName[1])."
+        $left = Get-SharedPrincipals $target | Where-Object { $_.Principal.'@odata.type' -match 'systemuser' }
+        if ($left) {
+            Write-Host "  these users keep access through an individual share:"
+            foreach ($p in $left) { Write-Host "    $((Invoke-Dv "systemusers($($p.Principal.ownerid))?`$select=domainname").domainname)" }
+            Write-Host "  clear each with -RevokeUserEmail, or leave them if they should keep it."
+        } else {
+            Write-Host "  no individual user shares remain - only the owner team can use the agent."
+        }
+    }
+
+    if ($UserEmail) {
+        $user = Resolve-DvUser $UserEmail
+        Write-Host "Share with: $($user.fullname) <$($user.domainname)>"
+
+        # 1. prvReadbot, the privilege that lets the user see the agent at all.
+        #    Only grant a role if none of theirs already carries it - Environment Maker
+        #    is environment-wide, and Bot Author / Bot Viewer / Agent Viewer carry it too.
+        $userRoles  = (Invoke-Dv "systemusers($($user.systemuserid))/systemuserroles_association?`$select=name,roleid").value
+        $prvReadBot = (Invoke-Dv "privileges?`$select=privilegeid&`$filter=name eq 'prvReadbot'").value[0].privilegeid
+        $holder     = $userRoles | Where-Object {
+            (Invoke-Dv "RetrieveRolePrivilegesRole(RoleId=$($_.roleid))").RolePrivileges.PrivilegeId -contains $prvReadBot
+        } | Select-Object -First 1
+        if ($holder) {
+            Write-Host "  role   $($holder.name) already carries prvReadbot"
+        } else {
+            $role = (Invoke-Dv ("roles?`$select=roleid&`$filter=name eq 'Environment Maker' and _businessunitid_value eq $($user._businessunitid_value)")).value
+            if (-not $role) { throw "No Environment Maker role in the user's business unit. Assign a role carrying prvReadbot by hand." }
+            Invoke-Dv "systemusers($($user.systemuserid))/systemuserroles_association/`$ref" -Method Post -Body @{ '@odata.id' = "$api/roles($($role[0].roleid))" } | Out-Null
+            Write-Host "  role   Environment Maker assigned - no existing role carried prvReadbot (had: $($userRoles.name -join ', '))"
+        }
+
+        # 2. Read access on the agent row.
+        Invoke-Dv 'GrantAccess' -Method Post -Body @{
+            Target          = $target
+            PrincipalAccess = @{ Principal = @{ '@odata.id' = "systemusers($($user.systemuserid))" }; AccessMask = 'ReadAccess' }
+        } | Out-Null
+        Write-Host "  share  ReadAccess granted on the agent"
+
+        # 3. Policy, only if it would swallow the share.
+        $fix = Get-SharePolicyFix -Policy ([int]$row.accesscontrolpolicy) -Groups $row.authorizedsecuritygroupids
+        if ($fix.Warn) { Write-Warning $fix.Warn }
+        if ($null -ne $fix.Set) {
+            Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{ accesscontrolpolicy = $fix.Set } | Out-Null
+            Write-Host "  policy was 2 with no groups (nobody) - set to $($fix.Set) $($PolicyName[$fix.Set])"
+        } else {
+            Write-Host "  policy left at $($row.accesscontrolpolicy) $($PolicyName[[int]$row.accesscontrolpolicy])"
+        }
+    }
+
+    if ($RevokeUserEmail) {
+        $user = Resolve-DvUser $RevokeUserEmail
+        Write-Host "Revoke: $($user.fullname) <$($user.domainname)>"
+
+        # 1. Drop the row share, then prove it is gone.
+        Invoke-Dv 'RevokeAccess' -Method Post -Body @{
+            Target  = $target
+            Revokee = @{ '@odata.id' = "systemusers($($user.systemuserid))" }
+        } | Out-Null
+        $still = Get-SharedPrincipals $target | Where-Object { $_.Principal.ownerid -eq $user.systemuserid }
+        if ($still) { throw "RevokeAccess returned success but the share is still there: $($still.AccessMask)" }
+        Write-Host "  share  revoked on the agent"
+
+        # 2. Policy, if it would make the revoke meaningless.
+        $fix = Get-RevokePolicyFix -Policy ([int]$row.accesscontrolpolicy) -Groups $row.authorizedsecuritygroupids
+        if ($fix.Warn) { Write-Warning $fix.Warn }
+        if ($null -ne $fix.Set) {
+            Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{ accesscontrolpolicy = $fix.Set } | Out-Null
+            Write-Host "  policy narrowed to $($fix.Set) $($PolicyName[$fix.Set])"
+        } else {
+            Write-Host "  policy left at $($row.accesscontrolpolicy) $($PolicyName[[int]$row.accesscontrolpolicy])"
+        }
+
+        # The environment role is deliberately left alone - it governs every agent here, not this one.
+        Write-Host "  role   left as is. Environment Maker governs the whole environment, not this agent."
+    }
+
+    $after = Invoke-Dv "bots($($row.botid))?`$select=accesscontrolpolicy,authorizedsecuritygroupids"
+    Write-Host "Now: policy=$($after.accesscontrolpolicy) $($PolicyName[[int]$after.accesscontrolpolicy]) $($after.authorizedsecuritygroupids)"
+
+    if ($NoPublish) {
+        Write-Host "NOT published (-NoPublish). Nothing above reaches the runtime until you run:"
+        Write-Host "    pac copilot publish --environment $OrgUrl --bot $Bot"
+        return
+    }
+
+    $pac = Resolve-Pac
+    # Publish by the agent's GUID, not its schema name. --bot takes either, but the
+    # id is already in hand from the row above, and it skips a name lookup that has
+    # been seen to crash pac with System.ArgumentException on a freshly imported
+    # agent that has never been published.
+    # pac.cmd also does not propagate exit codes, so the proof of a publish is the
+    # bot row's publishedon moving, not the process result.
+    $pubOut = & $pac copilot publish --environment $OrgUrl --bot $row.botid 2>&1 | ForEach-Object { "$_" }
+    $pubOut | ForEach-Object { Write-Host "  $_" }
+
+    if ($pubOut -match 'non-recoverable error') {
+        throw ("pac crashed while publishing $Bot. This is a fault in the CLI, not in the agent - the sharing " +
+               "changes above are already written. Its own log says why: " +
+               "$env:LOCALAPPDATA\Microsoft\PowerAppsCLI\<version>\tools\logs\pac-log.txt. " +
+               "Publish this agent from the Copilot Studio designer, or update pac and re-run.")
+    }
+
+    $publishedon = (Invoke-Dv "bots($($row.botid))?`$select=publishedon").publishedon
+    if (-not $publishedon) {
+        throw ("Not published: $Bot has never been published and still has no publish date. " +
+               "The sharing changes are already written. Check 'pac auth list' points at an identity " +
+               "that can publish in $OrgUrl, or publish once from the designer.")
+    }
+    if ($row.publishedon -and [datetime]$publishedon -le [datetime]$row.publishedon) {
+        throw ("Not published: publishedon is still $($row.publishedon). Check the active profile with " +
+               "'pac auth list' - the change itself is already written.")
+    }
+    Write-Host "Published at $publishedon."
+    Write-Host "An open conversation keeps working until it idles out after 30 minutes. Test with a fresh session."
 }
 
-$after = Invoke-Dv "bots($($row.botid))?`$select=accesscontrolpolicy,authorizedsecuritygroupids"
-Write-Host "Now: policy=$($after.accesscontrolpolicy) $($PolicyName[[int]$after.accesscontrolpolicy]) $($after.authorizedsecuritygroupids)"
-
-if ($NoPublish) {
-    Write-Host "NOT published (-NoPublish). Nothing above reaches the runtime until you run:"
-    Write-Host "    pac copilot publish --environment $OrgUrl --bot $Bot"
-    return
-}
-
-$pac = Resolve-Pac
-# pac.cmd does not propagate the exit code and a stale auth profile prints "Error:" then returns 0,
-# so the proof of a publish is the bot row's publishedon moving, not the process result.
-& $pac copilot publish --environment $OrgUrl --bot $Bot 2>&1 | ForEach-Object { "  $_" } | Write-Host
-$publishedon = (Invoke-Dv "bots($($row.botid))?`$select=publishedon").publishedon
-if (-not $publishedon -or ($row.publishedon -and [datetime]$publishedon -le [datetime]$row.publishedon)) {
-    throw "Not published: publishedon is still $($row.publishedon). Check the active profile with 'pac auth list' - the change itself is already written."
-}
-Write-Host "Published at $publishedon."
-Write-Host "An open conversation keeps working until it idles out after 30 minutes. Test with a fresh session."
+foreach ($b in $Bot) { Invoke-AgentStage -Bot $b }
 
 
