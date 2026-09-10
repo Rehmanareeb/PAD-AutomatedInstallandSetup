@@ -75,8 +75,11 @@
 
 .PARAMETER AllowedEnvironmentTag
   Value for the AllowedEnvironments tag stamped on both secrets. Power Platform
-  reads this tag to decide which environments may resolve the secret. Format is
-  '<tenantId>,<environmentId>' as Copilot Studio writes it.
+  reads this tag to decide which ENVIRONMENTS may resolve the secret, so it is a
+  comma-separated list of environment ids - NOT the tenant id. Defaults to
+  -EnvironmentId, which is what you want unless more than one environment should
+  read the same secret. Passing the tenant id here is rejected: it produces a
+  vault that looks correct and then fails to resolve at run time.
 
 .PARAMETER UsernameSecretName
   Key Vault secret name holding the F&O username. Default 'FnoUsername'.
@@ -162,7 +165,7 @@
                     -SubscriptionId 0c33fa37-4fa1-466d-a891-46af9e2f6e44 `
                     -ResourceGroupName rg-cua-uat -Location 'East US' `
                     -KeyVaultName kv-cua-uat-01 `
-                    -AllowedEnvironmentTag '<tenantId>,<environmentId>' `
+                    -EnvironmentId 20bbbb76-91c1-efde-bf32-8a5468336104 `
                     -DataverseAppId <app-guid> -DataverseTenantId <tenant-guid>
 
 .EXAMPLE
@@ -297,6 +300,47 @@ function ConvertFrom-PacConnectionList {
 function New-SecretReference {
     param([string] $Subscription, [string] $ResourceGroup, [string] $Vault, [string] $Secret)
     "/subscriptions/$Subscription/resourceGroups/$ResourceGroup/providers/Microsoft.KeyVault/vaults/$Vault/secrets/$Secret"
+}
+
+function Resolve-AllowedEnvironments {
+    <#
+      The AllowedEnvironments tag on each secret is a comma-separated list of
+      POWER PLATFORM ENVIRONMENT IDs - the environments allowed to resolve that
+      secret. It is NOT the tenant id.
+
+      Putting the tenant id here is the failure this guard exists for: the vault
+      is created, the tag is set, everything reports success, and then the
+      environment variable fails to resolve at run time because no environment in
+      the list matches the one asking. Nothing in the Azure or Power Platform
+      error text points at the tag.
+    #>
+    param([string] $Tag, [string] $EnvironmentId, [string] $TenantId)
+
+    if (-not $Tag) { $Tag = $EnvironmentId }
+    if (-not $Tag) {
+        throw 'No environment id for the AllowedEnvironments tag. Pass -EnvironmentId, or -AllowedEnvironmentTag with the environment id.'
+    }
+
+    $ids = @($Tag -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    foreach ($id in $ids) {
+        if (-not ($id -as [guid])) {
+            throw "AllowedEnvironments entry '$id' is not a GUID. The tag is a comma-separated list of Power Platform environment ids."
+        }
+        if ($TenantId -and $id -eq $TenantId) {
+            throw @"
+The AllowedEnvironments tag contains the TENANT id ($TenantId).
+
+That tag lists the Power Platform ENVIRONMENTS allowed to resolve the secret, not
+the tenant. Tagged this way the vault looks correctly configured and then the
+environment variable fails to resolve at run time, because no environment in the
+list matches the one asking.
+
+Pass -EnvironmentId instead, or -AllowedEnvironmentTag with the environment id
+(comma-separated if more than one environment should read the secret).
+"@
+        }
+    }
+    $ids -join ','
 }
 
 if ($SelfTest) {
@@ -1293,7 +1337,13 @@ try {
         $ResourceGroupName     = Read-RequiredValue  'Resource group name'                                  (Get-Fallback $ResourceGroupName     'ResourceGroupName')
         $Location              = Read-RequiredValue  'Azure region (e.g. East US)'                          (Get-Fallback $Location              'Location')
         $KeyVaultName          = Read-RequiredValue  'Key Vault name (globally unique)'                     (Get-Fallback $KeyVaultName          'KeyVaultName')
-        $AllowedEnvironmentTag = Read-RequiredValue  'AllowedEnvironments tag (<tenantId>,<environmentId>)' (Get-Fallback $AllowedEnvironmentTag 'AllowedEnvironmentTag')
+        # The AllowedEnvironments tag is the ENVIRONMENT id, not the tenant id.
+        if (-not $AllowedEnvironmentTag -and -not (Get-Fallback $AllowedEnvironmentTag 'AllowedEnvironmentTag') -and -not $EnvironmentId) {
+            $EnvironmentId = Read-RequiredValue 'Power Platform environment GUID (for the AllowedEnvironments secret tag)' (Get-Fallback $EnvironmentId 'EnvironmentId')
+        }
+        $AllowedEnvironmentTag = Resolve-AllowedEnvironments -EnvironmentId $EnvironmentId -TenantId $DataverseTenantId `
+                                    -Tag (Get-Fallback $AllowedEnvironmentTag 'AllowedEnvironmentTag')
+        Write-Info "AllowedEnvironments tag: $AllowedEnvironmentTag"
         $FnoUsername           = Read-RequiredValue  'F&O username'                                         (Get-Fallback $FnoUsername           'FnoUsername')
         $FnoPassword           = Read-RequiredSecret 'F&O password'                                         $FnoPassword
     }

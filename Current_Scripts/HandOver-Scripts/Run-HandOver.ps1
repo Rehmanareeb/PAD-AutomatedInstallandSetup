@@ -133,8 +133,11 @@
   Key Vault name, globally unique. Stage 1.
 
 .PARAMETER AllowedEnvironmentTag
-  AllowedEnvironments tag stamped on both secrets, '<tenantId>,<environmentId>'.
-  Power Platform reads it to decide which environments may resolve the secret.
+  AllowedEnvironments tag stamped on both secrets: a comma-separated list of
+  ENVIRONMENT ids, not the tenant id. Power Platform reads it to decide which
+  environments may resolve the secret. Defaults to -EnvironmentId. Passing the
+  tenant id is rejected - it produces a vault that looks correctly configured and
+  then fails to resolve at run time.
 
 .PARAMETER FnoUsername
   F&O username stored in the vault. Stage 1.
@@ -205,7 +208,6 @@
                      -SubscriptionId 0c33fa37-4fa1-466d-a891-46af9e2f6e44 `
                      -ResourceGroupName rg-cua-uat -Location 'East US' `
                      -KeyVaultName kv-cua-uat-01 `
-                     -AllowedEnvironmentTag '<tenantId>,<environmentId>' `
                      -ApplicationId <pad-app-guid> `
                      -DataverseAppId <dv-app-guid> `
                      -AuthClientId <auth-app-guid> `
@@ -532,6 +534,47 @@ function Invoke-Az {
 function New-SecretReference {
     param([string] $Subscription, [string] $ResourceGroup, [string] $Vault, [string] $Secret)
     "/subscriptions/$Subscription/resourceGroups/$ResourceGroup/providers/Microsoft.KeyVault/vaults/$Vault/secrets/$Secret"
+}
+
+function Resolve-AllowedEnvironments {
+    <#
+      The AllowedEnvironments tag on each secret is a comma-separated list of
+      POWER PLATFORM ENVIRONMENT IDs - the environments allowed to resolve that
+      secret. It is NOT the tenant id.
+
+      Putting the tenant id here is the failure this guard exists for: the vault
+      is created, the tag is set, everything reports success, and then the
+      environment variable fails to resolve at run time because no environment in
+      the list matches the one asking. Nothing in the Azure or Power Platform
+      error text points at the tag.
+    #>
+    param([string] $Tag, [string] $EnvironmentId, [string] $TenantId)
+
+    if (-not $Tag) { $Tag = $EnvironmentId }
+    if (-not $Tag) {
+        throw 'No environment id for the AllowedEnvironments tag. Pass -EnvironmentId, or -AllowedEnvironmentTag with the environment id.'
+    }
+
+    $ids = @($Tag -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    foreach ($id in $ids) {
+        if (-not ($id -as [guid])) {
+            throw "AllowedEnvironments entry '$id' is not a GUID. The tag is a comma-separated list of Power Platform environment ids."
+        }
+        if ($TenantId -and $id -eq $TenantId) {
+            throw @"
+The AllowedEnvironments tag contains the TENANT id ($TenantId).
+
+That tag lists the Power Platform ENVIRONMENTS allowed to resolve the secret, not
+the tenant. Tagged this way the vault looks correctly configured and then the
+environment variable fails to resolve at run time, because no environment in the
+list matches the one asking.
+
+Pass -EnvironmentId instead, or -AllowedEnvironmentTag with the environment id
+(comma-separated if more than one environment should read the secret).
+"@
+        }
+    }
+    $ids -join ','
 }
 
 function ConvertFrom-PacConnectionList {
@@ -2927,7 +2970,10 @@ try {
         $ResourceGroupName     = Read-RequiredValue  'Resource group name'                                  (Get-Fallback $ResourceGroupName     'ResourceGroupName')
         $Location              = Read-RequiredValue  'Azure region (e.g. East US)'                          (Get-Fallback $Location              'Location')
         $KeyVaultName          = Read-RequiredValue  'Key Vault name (globally unique)'                     (Get-Fallback $KeyVaultName          'KeyVaultName')
-        $AllowedEnvironmentTag = Read-RequiredValue  'AllowedEnvironments tag (<tenantId>,<environmentId>)' (Get-Fallback $AllowedEnvironmentTag 'AllowedEnvironmentTag')
+        # The AllowedEnvironments tag is the ENVIRONMENT id, not the tenant id.
+        $AllowedEnvironmentTag = Resolve-AllowedEnvironments -EnvironmentId $EnvironmentId -TenantId $TenantId `
+                                    -Tag (Get-Fallback $AllowedEnvironmentTag 'AllowedEnvironmentTag')
+        Write-Info "AllowedEnvironments tag: $AllowedEnvironmentTag"
         $FnoUsername           = Read-RequiredValue  'F&O username'                                         (Get-Fallback $FnoUsername           'FnoUsername')
         $FnoPassword           = Read-RequiredSecret 'F&O password'                                         $FnoPassword
     }
@@ -3721,7 +3767,10 @@ try {
             $ResourceGroupName     = Read-RequiredValue  'Resource group name'                                  (Get-Fallback $ResourceGroupName     'ResourceGroupName')
             $Location              = Read-RequiredValue  'Azure region (e.g. East US)'                          (Get-Fallback $Location              'Location')
             $KeyVaultName          = Read-RequiredValue  'Key Vault name (globally unique)'                     (Get-Fallback $KeyVaultName          'KeyVaultName')
-            $AllowedEnvironmentTag = Read-RequiredValue  'AllowedEnvironments tag (<tenantId>,<environmentId>)' (Get-Fallback $AllowedEnvironmentTag 'AllowedEnvironmentTag')
+            # The AllowedEnvironments tag is the ENVIRONMENT id, not the tenant id.
+        $AllowedEnvironmentTag = Resolve-AllowedEnvironments -EnvironmentId $EnvironmentId -TenantId $TenantId `
+                                    -Tag (Get-Fallback $AllowedEnvironmentTag 'AllowedEnvironmentTag')
+        Write-Info "AllowedEnvironments tag: $AllowedEnvironmentTag"
             $FnoUsername           = Read-RequiredValue  'F&O username'                                         (Get-Fallback $FnoUsername           'FnoUsername')
             $FnoPassword           = Read-RequiredSecret 'F&O password'                                         $FnoPassword
         }

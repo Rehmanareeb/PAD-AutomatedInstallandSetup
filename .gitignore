@@ -8,6 +8,7 @@
 !/.gitignore
 !/Current_Scripts/*.ps1
 !/Current_Scripts/HandOver-Scripts/*.ps1
+!/Current_Scripts/HandOver-Scripts/*.md
 
 # Never track agent/tooling state, whatever the rules above allow
 .claude/
