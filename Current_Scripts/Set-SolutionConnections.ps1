@@ -79,6 +79,17 @@
 .PARAMETER NewConnectionName
   Display name for the connection -CreateDataverse makes. Default 'dataverse-sp'.
 
+.PARAMETER CreateSharePoint
+  Create a SharePoint connection before binding, and use it. Opens a browser for
+  one sign-in - SharePoint has no service principal option - then polls until
+  the connection reports Connected. Requires `az login`.
+
+.PARAMETER SharePointConnectionName
+  Display name for that connection. Default 'sharepoint-oauth'.
+
+.PARAMETER ConsentTimeoutSeconds
+  How long to wait for that sign-in. Default 300.
+
 .PARAMETER Import
   Import the solution with the finished settings file. Without it the file is
   written and nothing touches the environment.
@@ -109,6 +120,9 @@ param(
     [string]   $TenantId,
     [string]   $EnvironmentId,
     [string]   $NewConnectionName = 'dataverse-sp',
+    [switch]   $CreateSharePoint,
+    [string]   $SharePointConnectionName = 'sharepoint-oauth',
+    [int]      $ConsentTimeoutSeconds = 300,
     [switch]   $Import,
     [switch]   $SelfTest,
     [switch]   $Help
@@ -217,15 +231,7 @@ if ($empty) {
 }
 
 
-if ($CreateDataverse) {
-    Write-Section 'CREATING A DATAVERSE CONNECTION'
-
-    if (-not $AppId)    { throw '-CreateDataverse needs -AppId.' }
-    if (-not $TenantId) { throw '-CreateDataverse needs -TenantId.' }
-    $secret = $env:PP_CLIENT_SECRET
-    if (-not $secret) {
-        throw 'Put the client secret in $env:PP_CLIENT_SECRET. It is deliberately not a parameter - a secret on a command line ends up in shell history and in every process listing.'
-    }
+if ($CreateDataverse -or $CreateSharePoint) {
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw 'Azure CLI is needed to create a connection.' }
     if (-not (az account show 2>$null)) { throw 'No Azure CLI session. Run: az login' }
 
@@ -247,14 +253,27 @@ if ($CreateDataverse) {
     }
     Write-Log "Environment $EnvironmentId"
 
+    # Every connection call wants this filter; without it the API answers
+    # MissingEnvironmentFilter.
+    $envFilter = '&%24filter=' + [uri]::EscapeDataString("environment eq '$EnvironmentId'")
+}
+
+
+if ($CreateDataverse) {
+    Write-Section 'CREATING A DATAVERSE CONNECTION'
+
+    if (-not $AppId)    { throw '-CreateDataverse needs -AppId.' }
+    if (-not $TenantId) { throw '-CreateDataverse needs -TenantId.' }
+    $secret = $env:PP_CLIENT_SECRET
+    if (-not $secret) {
+        throw 'Put the client secret in $env:PP_CLIENT_SECRET. It is deliberately not a parameter - a secret on a command line ends up in shell history and in every process listing.'
+    }
+
     $newId = (New-Guid).Guid.Replace('-', '')
     # The braces around $newId are load-bearing: '?' is legal in a PowerShell
     # variable name, so "$newId?api-version" reads as an empty variable.
-    # The environment filter is not optional on this endpoint - without it the
-    # read-back returns MissingEnvironmentFilter.
     $url = 'https://api.powerapps.com/providers/Microsoft.PowerApps/apis/' +
-           "shared_commondataserviceforapps/connections/${newId}?api-version=2016-11-01" +
-           '&%24filter=' + [uri]::EscapeDataString("environment eq '$EnvironmentId'")
+           "shared_commondataserviceforapps/connections/${newId}?api-version=2016-11-01" + $envFilter
 
     $body = @{
         properties = @{
@@ -295,6 +314,62 @@ if ($CreateDataverse) {
 
     # Pin it, so the binding below uses this one and not some older connection.
     $pins['shared_commondataserviceforapps'] = $newId
+}
+
+
+if ($CreateSharePoint) {
+    Write-Section 'CREATING A SHAREPOINT CONNECTION'
+
+    # SharePoint has no service principal option, so the connection has to be
+    # consented to by a person. What can be automated is everything around that:
+    # the shell, the consent link, catching the code the browser is handed back,
+    # and the confirm. The human part is one sign-in, usually one click.
+    $newSpId = 'shared-sharepointonl-' + [Guid]::NewGuid().ToString()
+    $spUrl   = 'https://api.powerapps.com/providers/Microsoft.PowerApps/apis/' +
+               "shared_sharepointonline/connections/${newSpId}?api-version=2016-11-01" + $envFilter
+
+    $spBody = @{ properties = @{
+        displayName          = $SharePointConnectionName
+        environment          = @{ id = "/providers/Microsoft.PowerApps/environments/$EnvironmentId"; name = $EnvironmentId }
+        connectionParameters = @{}
+    } } | ConvertTo-Json -Depth 10
+
+    Invoke-RestMethod -Method Put -Uri $spUrl -Headers $paHeaders -ContentType 'application/json' -Body $spBody | Out-Null
+    Write-Log "Created $newSpId unauthenticated, asking for a consent link"
+
+    # Signing in at the consent link is what authenticates the connection; the
+    # portal's follow-up confirmConsentCode call is bookkeeping, not a
+    # requirement. Verified: a connection reaches Connected on sign-in alone.
+    # So there is nothing to catch - ask the service, and poll.
+    $redirect = 'https://make.powerapps.com/connection/oauth/redirect?oauthPopupId=' + [Guid]::NewGuid()
+    $linkUrl  = 'https://api.powerapps.com/providers/Microsoft.PowerApps/apis/' +
+                "shared_sharepointonline/connections/$newSpId/getConsentLink?api-version=2016-11-01" + $envFilter
+    $link = (Invoke-RestMethod -Method Post -Uri $linkUrl -Headers $paHeaders -ContentType 'application/json' `
+                -Body (@{ redirectUrl = $redirect } | ConvertTo-Json)).consentLink
+    if (-not $link) { throw 'The consent service returned no link.' }
+
+    Write-Host ''
+    Write-Host '  A browser window is opening. Sign in as the account the flows should run as.' -ForegroundColor Yellow
+    Write-Host "  If it does not open, paste this in yourself:`n  $link"
+    Start-Process $link
+
+    $deadline = (Get-Date).AddSeconds($ConsentTimeoutSeconds)
+    do {
+        Start-Sleep -Seconds 3
+        $spStatus = (Invoke-RestMethod -Uri $spUrl -Headers $paHeaders).properties.statuses | Select-Object -First 1
+        Write-Host "  waiting for sign-in... $($spStatus.status)"
+    } while ($spStatus.status -ne 'Connected' -and (Get-Date) -lt $deadline)
+
+    if ($spStatus.status -ne 'Connected') {
+        throw ("Still '$($spStatus.status)' after $ConsentTimeoutSeconds seconds. " +
+               "Connection $newSpId is left behind - delete it in make.powerapps.com, or rerun with " +
+               "-Connection shared_sharepointonline=$newSpId once you have signed it in there.")
+    }
+
+    $spMade = Invoke-RestMethod -Uri $spUrl -Headers $paHeaders
+    Write-Log "Created $newSpId  ($($spMade.properties.displayName))  Connected as $($spMade.properties.authenticatedUser.name)"
+
+    $pins['shared_sharepointonline'] = $newSpId
 }
 
 
