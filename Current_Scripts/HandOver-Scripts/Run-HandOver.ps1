@@ -48,10 +48,6 @@
   Print the stages that would run and every value collected, then stop without
   touching anything. Use it to check a long command line before committing.
 
-.PARAMETER SourceRoot
-  Folder holding the original scripts. Defaults to this script's parent, i.e.
-  Current_Scripts.
-
 .PARAMETER OrgUrl
   Target Dataverse org URL, e.g. https://org35fd7a12.crm.dynamics.com
 
@@ -124,14 +120,13 @@
 .PARAMETER Agent2CuaComponentSchema
   Schema name of Agent 2's Computer Use action. Stage 2.
 
-.PARAMETER Agent2DisplayName
-  Agent 2's display name in Copilot Studio. Stage 2, manual authentication.
+.PARAMETER PublishNow
+  Publish Agent 2 at the end of stage 2, rather than leaving the publish to
+  stage 3.
 
-.PARAMETER AuthClientId
-  Entra app Agent 2 authenticates its users with. Stage 2.
-
-.PARAMETER AuthClientSecret
-  Its client secret, SecureString. Stage 2.
+.PARAMETER AcceptChanges
+  Stage 2 does not pause for confirmation when Agent 2 is already bound to a
+  different connection.
 
 .PARAMETER Everyone
   Share both agents with the organisation. Stage 3. This is the default grant
@@ -183,9 +178,6 @@ param(
     [switch] $OnlyMachine,
     [switch] $OnlyShare,
     [switch] $WhatIfStages,
-
-    [ValidateNotNullOrEmpty()]
-    [string] $SourceRoot = (Split-Path -Parent $PSScriptRoot),
 
     # --- shared ---------------------------------------------------------------
     [string] $OrgUrl,
@@ -241,15 +233,22 @@ param(
     [string] $Agent2SchemaName,
     [string] $Agent2CuaComponentSchema,
     [string] $Agent2DisplayName,
-    [string] $SolutionUniqueName,
     [string] $AuthClientId,
     [securestring] $AuthClientSecret,
     [string] $AuthTenantId,
+    [string] $SolutionUniqueName,
     [switch] $Interactive,
+    [switch] $AcceptChanges,
+    [switch] $PublishNow,
+    [switch] $SkipInstall,
     [switch] $SkipRegistration,
+    [switch] $SkipComputerUse,
     [switch] $SkipConnection,
     [switch] $SkipBinding,
     [switch] $SkipManualAuth,
+    [switch] $SkipBrowserExtensions,
+    [switch] $SkipConnectivityCheck,
+    [switch] $Reinstall,
     [switch] $Force,
 
     # --- stage 3: share and publish -------------------------------------------
@@ -402,18 +401,20 @@ try {
         if (-not $ConnectionName) { $ConnectionName = "$MachineName-CUA" }
 
         if (-not $SkipConnection) {
-            $MachineUsername          = Read-RequiredValue  "Windows username that signs in to $MachineName" (Get-Fallback $MachineUsername 'MachineUsername')
-            $MachinePassword          = Read-RequiredSecret 'Windows password'                               $MachinePassword
-            $Agent2CuaComponentSchema = Read-RequiredValue  'Agent 2 Computer Use action schema (e.g. cr720_Agent2UITesting.action.Computeruse-Computeruse)' (Get-Fallback $Agent2CuaComponentSchema 'Agent2CuaComponentSchema')
+            $MachineUsername = Read-RequiredValue  "Windows username that signs in to $MachineName" (Get-Fallback $MachineUsername 'MachineUsername')
+            $MachinePassword = Read-RequiredSecret 'Windows password'                               $MachinePassword
         }
         if (-not $SkipBinding) {
+            $Agent2CuaComponentSchema = Read-RequiredValue 'Agent 2 Computer Use action schema (e.g. cr720_Agent2UITesting.action.Computeruse-Computeruse)' (Get-Fallback $Agent2CuaComponentSchema 'Agent2CuaComponentSchema')
+        }
+        if ($PublishNow) {
             $Agent2SchemaName = Read-RequiredValue 'Agent 2 schema name (schema name, NOT display name)' $Agent2SchemaName
         }
         if (-not $SkipManualAuth) {
-            $Agent2DisplayName = Read-RequiredValue  "Agent 2 display name as shown in Copilot Studio (e.g. 'Agent 2 UI Testing')" (Get-Fallback $Agent2DisplayName 'Agent2DisplayName')
+            $Agent2DisplayName = Read-RequiredValue  "Agent 2 DISPLAY name as shown in Copilot Studio (e.g. 'Agent 2 UI Testing')" (Get-Fallback $Agent2DisplayName 'Agent2DisplayName')
             $AuthClientId      = Read-RequiredValue  'Agent authentication app (client) id' (Get-Fallback $AuthClientId 'AuthClientId')
             $AuthClientSecret  = Read-RequiredSecret 'Agent authentication app client secret' $AuthClientSecret
-            if (-not $AuthTenantId) { $AuthTenantId = $TenantId }
+            if (-not $AuthTenantId)       { $AuthTenantId       = $TenantId }
             if (-not $SolutionUniqueName) { $SolutionUniqueName = $State.SolutionUniqueName }
         }
     }
@@ -460,7 +461,6 @@ try {
             $stage = '1 Prepare-Sol.ps1'
             Write-Banner 'Stage 1 of 3 - Prepare-Sol.ps1'
             $a = @{
-                SourceRoot               = $SourceRoot
                 OrgUrl                   = $OrgUrl
                 Mode                     = $Mode
                 PackageType              = $PackageType
@@ -500,7 +500,6 @@ try {
             $stage = '2 Machine-and-Cua.ps1'
             Write-Banner 'Stage 2 of 3 - Machine-and-Cua.ps1'
             $a = @{
-                SourceRoot         = $SourceRoot
                 OrgUrl             = $OrgUrl
                 EnvironmentId      = $EnvironmentId
                 TenantId           = $TenantId
@@ -509,22 +508,31 @@ try {
                 ConnectionName     = $ConnectionName
             }
             if ($ApplicationId)            { $a.ApplicationId            = $ApplicationId }
-            if ($PadClientSecret)          { $a.PadClientSecret          = $PadClientSecret }
+            # The orchestrator names it -PadClientSecret to keep it distinct from
+            # the Dataverse app secret; the stage script calls it -ClientSecret.
+            if ($PadClientSecret)          { $a.ClientSecret             = $PadClientSecret }
             if ($InstallerUrl)             { $a.InstallerUrl             = $InstallerUrl }
             if ($MachineUsername)          { $a.MachineUsername          = $MachineUsername }
             if ($MachinePassword)          { $a.MachinePassword          = $MachinePassword }
             if ($Agent2SchemaName)         { $a.Agent2SchemaName         = $Agent2SchemaName }
             if ($Agent2CuaComponentSchema) { $a.Agent2CuaComponentSchema = $Agent2CuaComponentSchema }
             if ($Agent2DisplayName)        { $a.Agent2DisplayName        = $Agent2DisplayName }
-            if ($SolutionUniqueName)       { $a.SolutionUniqueName       = $SolutionUniqueName }
             if ($AuthClientId)             { $a.AuthClientId             = $AuthClientId }
             if ($AuthClientSecret)         { $a.AuthClientSecret         = $AuthClientSecret }
             if ($AuthTenantId)             { $a.AuthTenantId             = $AuthTenantId }
+            if ($SolutionUniqueName)       { $a.SolutionUniqueName       = $SolutionUniqueName }
+            if ($SkipManualAuth)           { $a.SkipManualAuth           = $true }
             if ($Interactive)              { $a.Interactive              = $true }
+            if ($AcceptChanges)            { $a.AcceptChanges            = $true }
+            if ($PublishNow)               { $a.PublishNow               = $true }
+            if ($SkipInstall)              { $a.SkipInstall              = $true }
             if ($SkipRegistration)         { $a.SkipRegistration         = $true }
+            if ($SkipComputerUse)          { $a.SkipComputerUse          = $true }
             if ($SkipConnection)           { $a.SkipConnection           = $true }
             if ($SkipBinding)              { $a.SkipBinding              = $true }
-            if ($SkipManualAuth)           { $a.SkipManualAuth           = $true }
+            if ($SkipBrowserExtensions)    { $a.SkipBrowserExtensions    = $true }
+            if ($SkipConnectivityCheck)    { $a.SkipConnectivityCheck    = $true }
+            if ($Reinstall)                { $a.Reinstall                = $true }
             if ($Force)                    { $a.Force                    = $true }
             & (Join-Path $PSScriptRoot 'Machine-and-Cua.ps1') @a
         }
@@ -532,7 +540,7 @@ try {
         if ($runShare) {
             $stage = '3 Share-Agents.ps1'
             Write-Banner 'Stage 3 of 3 - Share-Agents.ps1'
-            $a = @{ SourceRoot = $SourceRoot; OrgUrl = $OrgUrl; Agent = $Agent }
+            $a = @{ OrgUrl = $OrgUrl; Agent = $Agent }
             if ($Everyone)        { $a.Everyone        = $true }
             if ($UserEmail)       { $a.UserEmail       = $UserEmail }
             if ($RevokeUserEmail) { $a.RevokeUserEmail = $RevokeUserEmail }
