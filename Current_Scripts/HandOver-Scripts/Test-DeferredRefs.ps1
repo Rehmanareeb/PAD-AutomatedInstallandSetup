@@ -67,6 +67,17 @@ foreach ($file in 'Prepare-Sol.ps1', 'Run-HandOver.ps1') {
     $calls = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and
                               $args[0].GetCommandName() -eq 'New-ConsentedConnection' }, $true))
     Check "$file one consent helper, used twice" ($defs.Count -eq 1 -and $calls.Count -eq 2) "def=$($defs.Count) calls=$($calls.Count)"
+
+    <#
+      The 401: with -SkipCreateDataverse -SkipCreateSharePoint the token block
+      was skipped, so the consent PUT went out with no Authorization header.
+      The gate must name ConsentConnector, and the helper must refuse to PUT
+      without headers rather than let the service answer 401.
+    #>
+    $gate = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] -and
+                             $args[0].Clauses[0].Item1.Extent.Text -match 'DoDataverse\s+-or\s+\$DoSharePoint' }, $true))
+    Check "$file token gate covers ConsentConnector" ($gate.Count -eq 1 -and $gate[0].Clauses[0].Item1.Extent.Text -match 'ConsentConnector') $(if ($gate.Count) { $gate[0].Clauses[0].Item1.Extent.Text } else { 'gate not found' })
+    Check "$file helper refuses PUT with no headers" ($defs.Count -eq 1 -and $defs[0].Extent.Text -match '-not \$paHeaders') 'guard present'
     Check "$file helper defined before first use" ($defs.Count -eq 1 -and $calls.Count -and $defs[0].Extent.StartLineNumber -lt ($calls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]) "def L$($defs[0].Extent.StartLineNumber)"
 }
 

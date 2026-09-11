@@ -1134,7 +1134,14 @@ function Set-SolutionConnections {
 
     $paHeaders = $null
     $envFilter = $null
-    if ($DoDataverse -or $DoSharePoint) {
+    <#
+      $ConsentConnector belongs in this condition, not just the two Do- flags.
+      With -SkipCreateDataverse -SkipCreateSharePoint both flags are false, this
+      block was skipped, and $paHeaders/$envFilter stayed $null - so an on-demand
+      consent later in the bind loop PUT with no Authorization header and got a
+      bare 401 with nothing to point at.
+    #>
+    if ($DoDataverse -or $DoSharePoint -or @($ConsentConnector).Count -gt 0) {
         if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw 'Azure CLI is needed to create a connection.' }
         if (-not (az account show 2>$null)) { throw 'No Azure CLI session. Run: az login' }
 
@@ -1224,6 +1231,12 @@ function Set-SolutionConnections {
             [Parameter(Mandatory)][string] $Name,
             [string] $IdPrefix
         )
+
+        if (-not $paHeaders) {
+            throw ("No Power Apps token available to create a '$Connector' connection. " +
+                   'The token block is gated on $DoDataverse / $DoSharePoint / $ConsentConnector - ' +
+                   'one of them must cover this path, or the PUT goes out unauthenticated and returns a bare 401.')
+        }
 
         Assert-AzUserSession "Creating the first '$Connector' connection in an environment"
         $newId = if ($IdPrefix) { $IdPrefix + [Guid]::NewGuid().ToString() }
