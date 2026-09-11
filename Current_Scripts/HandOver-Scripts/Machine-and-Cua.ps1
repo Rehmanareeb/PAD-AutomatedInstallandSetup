@@ -232,12 +232,10 @@
 param(
     [switch] $Help,
 
-    # --- environment ----------------------------------------------------------
     [string] $OrgUrl,
     [string] $EnvironmentId,
     [string] $TenantId,
 
-    # --- machine registration -------------------------------------------------
     [string] $ApplicationId,
     [securestring] $ClientSecret,
     [ValidateNotNullOrEmpty()]
@@ -253,23 +251,18 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $EdgeExtensionId   = 'kagpabjoboikccfdghpdlaaopmgpgfdc',
 
-    # --- computer use connection ---------------------------------------------
     [string] $ConnectionName,
     [string] $MachineUsername,
     [securestring] $MachinePassword,
 
-    # --- agent ----------------------------------------------------------------
     [string] $Agent2SchemaName,
     [string] $Agent2CuaComponentSchema,
     [string] $Agent2DisplayName,
 
-    # --- agent manual (Custom Entra) authentication ---------------------------
     [string] $AuthClientId,
     [securestring] $AuthClientSecret,
     [string] $AuthTenantId,
     [string] $SolutionUniqueName,
-    # Platform constants: the same in every tenant. Parameters so a Microsoft
-    # change can be worked around without editing the script.
     [ValidateNotNullOrEmpty()]
     [string] $ServiceProviderId = '5232e24f-b6c6-4920-b09d-d93a520c92e9',
     [ValidateNotNullOrEmpty()]
@@ -279,7 +272,6 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $BapApiBaseUrl     = 'https://api.bap.microsoft.com',
 
-    # --- flow control ---------------------------------------------------------
     [switch] $Interactive,
     [switch] $AcceptChanges,
     [switch] $PublishNow,
@@ -298,8 +290,6 @@ param(
 $ErrorActionPreference = 'Stop'
 if ($Help) { Get-Help $PSCommandPath -Detailed; return }
 
-# Windows PowerShell 5.1 still negotiates TLS 1.0/1.1 by default on some builds;
-# every endpoint below requires 1.2.
 if ($PSVersionTable.PSVersion.Major -lt 6) {
     [Net.ServicePointManager]::SecurityProtocol =
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -309,21 +299,13 @@ $PadRoot         = "${env:ProgramFiles(x86)}\Power Automate Desktop"
 $RegExe          = Join-Path $PadRoot 'PAD.MachineRegistration.Silent.exe'
 $ConnectorApi    = 'shared_computeroperator'
 $PowerAppsScope  = 'https://service.powerapps.com/'
-# Microsoft's own public client, which every tenant already trusts for Dataverse -
-# no app registration and no "allow public client flows" needed for a device code.
 $PublicClientId  = '51f81489-12ee-4a9e-aaae-a2591f45987d'
 
-# ==============================================================================
-# output
-# ==============================================================================
 function Write-Stage { param([string] $m) Write-Host "`n=== $m" -ForegroundColor Cyan }
 function Write-Info  { param([string] $m) Write-Host "    $m" }
 function Write-Ok    { param([string] $m) Write-Host "    $m" -ForegroundColor Green }
 function Write-Gate  { param([string] $m) Write-Host "    GATE  $m" -ForegroundColor Green }
 
-# ==============================================================================
-# input
-# ==============================================================================
 function Read-RequiredValue {
     param([string] $Prompt, [string] $Value)
     while ([string]::IsNullOrWhiteSpace($Value)) { $Value = (Read-Host $Prompt).Trim() }
@@ -366,9 +348,6 @@ function ConvertTo-OrgUrl {
     "https://$($uri.Host -replace '\.api\.', '.')"
 }
 
-# ==============================================================================
-# state shared with the other hand-over scripts. Never holds a secret.
-# ==============================================================================
 $StatePath = Join-Path $PSScriptRoot 'handover-state.json'
 $State = if (Test-Path -LiteralPath $StatePath) {
     Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
@@ -381,16 +360,11 @@ function Save-State {
     foreach ($k in $Values.Keys) {
         if ($Values[$k]) { $State | Add-Member -NotePropertyName $k -NotePropertyValue $Values[$k] -Force }
     }
-    # 5.1 has no 'utf8NoBOM', and its -Encoding utf8 means UTF-8 WITH a BOM.
-    # Write through .NET so both editions agree.
     [System.IO.File]::WriteAllText($StatePath, ($State | ConvertTo-Json -Depth 4),
                                    (New-Object System.Text.UTF8Encoding $false))
     Write-Info "state    $StatePath"
 }
 
-# ==============================================================================
-# preflight
-# ==============================================================================
 function Assert-Admin {
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
                ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -403,7 +377,6 @@ function Assert-Admin {
 function Test-WindowsEdition {
     $os = Get-CimInstance Win32_OperatingSystem
     Write-Info "OS: $($os.Caption) ($($os.Version))"
-    # Home editions cannot host the machine-runtime service.
     if ($os.Caption -match 'Home') {
         throw "Power Automate machine registration is not supported on $($os.Caption). Use Pro, Enterprise or Server."
     }
@@ -432,9 +405,6 @@ function Test-Connectivity {
     }
 }
 
-# ==============================================================================
-# local registration record
-# ==============================================================================
 function Get-LocalRegistration {
     <#
       Power Automate records its own registration under HKLM. This is the
@@ -468,9 +438,6 @@ function Get-LocalRegistration {
     $null
 }
 
-# ==============================================================================
-# install
-# ==============================================================================
 function Get-InstalledPad {
     if (Test-Path $RegExe) { return (Get-Item $RegExe).VersionInfo.ProductVersion }
     $null
@@ -489,7 +456,6 @@ function Install-Pad {
     Write-Info ("Downloaded {0} MB" -f [math]::Round((Get-Item $installer).Length / 1MB, 1))
 
     Write-Info 'Installing silently (desktop app, machine runtime, browser extensions).'
-    # -ACCEPTEULA is mandatory for unattended installation.
     $proc = Start-Process -FilePath $installer -ArgumentList @('-Silent', '-Install', '-ACCEPTEULA') `
                           -Wait -PassThru -NoNewWindow
     if ($proc.ExitCode -ne 0) { throw "Installer failed with exit code $($proc.ExitCode)." }
@@ -514,8 +480,6 @@ function Enable-BrowserExtensions {
     foreach ($b in $browsers) {
         if (-not (Test-Path $b.Key)) { New-Item -Path $b.Key -Force | Out-Null }
         $policy = Get-Item -Path $b.Key
-        # An existing entry may carry a ';<update-url>' suffix, so match on the
-        # id prefix rather than the whole string.
         $already = $false
         foreach ($name in $policy.GetValueNames()) {
             if ($policy.GetValue($name) -like "$($b.Id)*") { $already = $true; break }
@@ -530,14 +494,9 @@ function Enable-BrowserExtensions {
     }
 }
 
-# ==============================================================================
-# register
-# ==============================================================================
 function Register-Machine {
     param([string] $Secret)
 
-    # -clientsecret carries NO value on the command line: the secret is read from
-    # stdin, so it never appears in the process list.
     $argList = @('-register',
                  '-applicationid', $ApplicationId,
                  '-clientsecret',
@@ -585,7 +544,6 @@ Common causes:
 }
 
 function Confirm-Runtime {
-    # The runtime is a Windows service; the PAD GUI never needs to be launched.
     $svcs = Get-Service -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match 'UIFlow|PowerAutomate|PAD' }
     if (-not $svcs) {
@@ -601,9 +559,6 @@ function Confirm-Runtime {
     }
 }
 
-# ==============================================================================
-# tokens
-# ==============================================================================
 function Get-HttpErrorBody {
     <#
       Dataverse, AAD and the Power Apps API all explain themselves in the
@@ -626,7 +581,7 @@ function Get-AppOnlyToken {
     $body = @{
         grant_type    = 'client_credentials'
         client_id     = $ApplicationId
-        client_secret = $Secret          # POST body, never the URL or a command line
+        client_secret = $Secret
         scope         = "$Resource/.default"
     }
     $token = Invoke-RestMethod -Method Post -Body $body `
@@ -656,8 +611,6 @@ function Get-DeviceCodeToken {
                 }).access_token
         }
         catch {
-            # authorization_pending is the normal "not signed in yet" response;
-            # anything else is fatal and worth showing verbatim.
             $body = Get-HttpErrorBody $_
             $err  = ''
             try { $err = ($body | ConvertFrom-Json).error } catch { }
@@ -667,6 +620,38 @@ function Get-DeviceCodeToken {
         }
     }
     throw 'Device code expired before sign-in completed.'
+}
+
+function Get-AzSessionKind {
+    <#
+      What az is signed in as: 'user', 'servicePrincipal', or '' for no session.
+      `az account show --query user.type` is the only question both can answer.
+    #>
+    $kind = ''
+    try { $kind = (& az account show --query user.type --output tsv --only-show-errors 2>$null | Out-String).Trim() }
+    catch { $kind = '' }
+    if ($LASTEXITCODE -ne 0) { $kind = '' }
+    $kind
+}
+
+function Assert-AzUserSession {
+    <#
+      Most of this script runs perfectly well signed in as a service principal -
+      machine registration and the computer-use flag are already app-only. Two
+      things here are not, and each fails deep and unhelpfully when one tries:
+        - the Computer Use connection - the connectivity service answers code
+          10006, because these connections are created with sharing disabled
+        - step 4.4 - the Copilot gateway rejects a token whose idtyp is 'app'
+      So say so here, before the call, instead of after it.
+    #>
+    param([Parameter(Mandatory)][string] $What)
+    $kind = Get-AzSessionKind
+    if (-not $kind) { throw 'No Azure CLI session. Run: az login' }
+    if ($kind -eq 'servicePrincipal') {
+        throw ("$What cannot be done by a service principal, and az is signed in as one. " +
+               'Sign in as a person for this step (az login), or pass -Interactive to sign in ' +
+               "with a device code. See 'Where app-only does not work' in README.md.")
+    }
 }
 
 function Get-DelegatedToken {
@@ -682,7 +667,6 @@ function Get-DelegatedToken {
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
         throw 'Azure CLI (az) not found. Install it and run `az login`, or pass -Interactive to sign in with a device code.'
     }
-    # --query/-o tsv so the token never lands in a file or the process list.
     $token = az account get-access-token --resource $Resource --query accessToken -o tsv 2>&1
     if ($LASTEXITCODE -ne 0 -or -not $token) {
         throw "az could not get a token for $Resource. Run 'az login' as the account that will own the connection.`n$token"
@@ -690,9 +674,6 @@ function Get-DelegatedToken {
     "$token".Trim()
 }
 
-# ==============================================================================
-# Dataverse
-# ==============================================================================
 function Invoke-Dv {
     param(
         [string] $Method = 'Get',
@@ -708,11 +689,7 @@ function Invoke-Dv {
         'OData-Version'    = '4.0'
         'OData-MaxVersion' = '4.0'
     }
-    # If-Match keeps a PATCH update-only; without it Dataverse would upsert.
     if ($Method -eq 'Patch') { $headers['If-Match'] = '*' }
-    # Without this the row lands in the Default solution only, and the agent
-    # publishes a package that does not contain it - which the runtime reports as
-    # SystemError on every message.
     if ($Solution)       { $headers['MSCRM.SolutionUniqueName'] = $Solution }
     if ($Representation) { $headers['Prefer'] = 'return=representation' }
 
@@ -726,7 +703,6 @@ function Invoke-Dv {
         $body = Get-HttpErrorBody $_
         $msg  = $body
         try { $msg = ($body | ConvertFrom-Json).error.message } catch { }
-        # Query string dropped: it is noise, and keeps filter values out of logs.
         throw "$Method $($Path -replace '\?.*$', '') failed: $msg"
     }
 }
@@ -807,19 +783,14 @@ Do not clone the VM again afterwards.
         return $GroupId
     }
 
-    # Only usagetype. The portal also sends statecode/statuscode/
-    # preferredqueuingtype/groupmetadata; including those risks overwriting
-    # settings changed elsewhere.
     try {
         Invoke-Dv -Method Patch -Path "flowmachinegroups($GroupId)" -Body @{ usagetype = 1 } -Token $Token | Out-Null
-        # Confirm it took, rather than trusting the 204.
         $after = Invoke-Dv -Path "flowmachinegroups($GroupId)?`$select=name,usagetype" -Token $Token
         if ($after.usagetype -ne 1) { throw "PATCH accepted but usagetype is still $($after.usagetype)." }
         Write-Ok 'Enabled for computer use (usagetype = 1).'
         Write-Warning "This applies to EVERY machine in group '$($group.name)', not just $MachineName."
     }
     catch {
-        # Undocumented column: never let it fail the run. The portal toggle works.
         Write-Warning $_.Exception.Message
         Write-Host @"
 Could not enable computer use automatically. Do it by hand:
@@ -829,9 +800,6 @@ Could not enable computer use automatically. Do it by hand:
     $GroupId
 }
 
-# ==============================================================================
-# Computer Use connection
-# ==============================================================================
 function New-CuaConnection {
     <#
       PUTs a shared_computeroperator connection carrying the machine GROUP id and
@@ -841,13 +809,11 @@ function New-CuaConnection {
     #>
     param([string] $PowerAppsToken, [string] $GroupId, [string] $Username, [string] $Password)
 
+    Assert-AzUserSession 'Creating the Computer Use connection'
+
     $connectionId = (New-Guid).Guid.Replace('-', '')
     Write-Info "New connection id: $connectionId"
 
-    # The braces on ${connectionId} are load-bearing: '?' is a legal character in
-    # a PowerShell variable name, so "$connectionId?api-version" reads as the
-    # variable $connectionId?api - empty - and the API rejects the request with
-    # InvalidApiVersion. Do not "simplify" them away.
     $uri = "https://api.powerapps.com/providers/Microsoft.PowerApps/apis/" +
            "$ConnectorApi/connections/${connectionId}?api-version=2016-11-01" +
            "&%24filter=$([uri]::EscapeDataString("environment eq '$EnvironmentId'"))"
@@ -913,9 +879,6 @@ function Get-CuaConnectionId {
            (($all | ForEach-Object { "    $($_.properties.displayName)  ->  $($_.name)" }) -join "`n"))
 }
 
-# ==============================================================================
-# agent binding
-# ==============================================================================
 function Get-ActionSolution {
     <#
       The connection reference has to live in the same solution as the action, or
@@ -947,7 +910,6 @@ function Set-AgentBinding {
     $linkNav = 'botcomponent_connectionreference'
     $select  = 'connectionreferenceid,connectionreferencelogicalname,connectorid,connectionid'
 
-    # --- 4.1 the action -------------------------------------------------------
     $filter = [uri]::EscapeDataString("schemaname eq '$Agent2CuaComponentSchema'")
     $comp = @((Invoke-Dv -Path "botcomponents?`$select=botcomponentid,schemaname,data&`$filter=$filter" -Token $Token).value)
     if ($comp.Count -ne 1) {
@@ -974,8 +936,6 @@ function Set-AgentBinding {
         if ($existing) { Write-Ok "Already bound to $ConnectionId - nothing to do."; return }
     }
     elseif (-not $AcceptChanges) {
-        # Only a REBIND is worth pausing over: it moves the live agent to a
-        # different machine. A first-time binding needs no ceremony.
         Write-Host @"
 
     The agent is currently bound to a different connection.
@@ -990,7 +950,6 @@ function Set-AgentBinding {
     $solution = Get-ActionSolution -BotComponentId $comp.botcomponentid -Token $Token
     Write-Info "solution         -> $solution"
 
-    # --- 4.2 the connection reference row -------------------------------------
     $targetRow = @((Invoke-Dv -Path ("connectionreferences?`$select=$select&`$filter=" +
         [uri]::EscapeDataString("connectionreferencelogicalname eq '$targetName'")) -Token $Token).value)[0]
 
@@ -1010,7 +969,6 @@ function Set-AgentBinding {
         Write-Ok "reference row    -> created $($targetRow.connectionreferenceid) in $solution"
     }
 
-    # --- link the action to exactly this row ----------------------------------
     $linked = @((Invoke-Dv -Path "botcomponents($($comp.botcomponentid))?`$select=botcomponentid&`$expand=$linkNav(`$select=connectionreferenceid)" -Token $Token).$linkNav)
     foreach ($l in $linked | Where-Object { $_.connectionreferenceid -ne $targetRow.connectionreferenceid }) {
         Invoke-Dv -Method Delete -Path "botcomponents($($comp.botcomponentid))/$linkNav($($l.connectionreferenceid))/`$ref" -Token $Token | Out-Null
@@ -1024,7 +982,6 @@ function Set-AgentBinding {
         Write-Ok "link             -> $($targetRow.connectionreferenceid)"
     }
 
-    # --- 4.3 repoint the action ----------------------------------------------
     if ($actionName -ne $targetName) {
         $newData = [regex]::Replace($comp.data, $linePattern, {
             param($x) $x.Groups[1].Value + $targetName
@@ -1071,8 +1028,6 @@ function Test-AgentBinding {
         throw "Verification failed: the row reads back with connectionid '$($nowRow.connectionid)', expected '$ConnectionId'."
     }
 
-    # Called on its own - after 4.4, say - there is no solution name in hand, so
-    # read it off the action the same way the binding did.
     if (-not $Solution) { $Solution = Get-ActionSolution -BotComponentId $comp.botcomponentid -Token $Token }
 
     $inSolution = @(@((Invoke-Dv -Path ('solutioncomponents?$select=_solutionid_value&$filter=' +
@@ -1101,10 +1056,6 @@ function Publish-Agent {
     if (-not (Get-Command pac -ErrorAction SilentlyContinue)) {
         throw 'Power Platform CLI (pac) not found - install from https://aka.ms/PowerAppsCLI, or publish from the designer. The binding is already written.'
     }
-    # Publish by GUID, not schema name: --bot takes either, but the id is already
-    # in hand and it skips a name lookup that has been seen to crash pac on a
-    # freshly imported agent that has never been published. pac.cmd also does not
-    # propagate exit codes, so the proof of a publish is publishedon moving.
     $out = & pac copilot publish --environment $OrgUrl --bot $bot.botid 2>&1 | ForEach-Object { "$_" }
     $out | ForEach-Object { Write-Info $_ }
 
@@ -1118,15 +1069,6 @@ function Publish-Agent {
     Write-Ok "Published at $publishedon."
 }
 
-# ==============================================================================
-# 4.4  manual (Custom Entra) authentication
-#
-# Copilot Studio publishes no supported API for this, so everything below is
-# discovery against internal endpoints, with each answer validated before use.
-# The helpers are nested so they resolve $TenantId, $ClientId, $ClientSecret and
-# the rest from this function's own parameters - which also keeps the plaintext
-# secret scoped to this call rather than the whole script.
-# ==============================================================================
 function Set-Agent2ManualAuth {
     param(
         [Parameter(Mandatory)][string] $TenantId,
@@ -1144,7 +1086,6 @@ function Set-Agent2ManualAuth {
 
     $DataverseUrl = $DataverseUrl.TrimEnd('/')
 
-    # ---------------------------------------------------------------- plumbing
     function Read-ErrorResponseBody {
         param($Exception)
         $message = $Exception.Message
@@ -1240,7 +1181,6 @@ function Set-Agent2ManualAuth {
         @($result)
     }
 
-    # ------------------------------------------------------------------ tokens
     function Ensure-AzLogin {
         Write-Info 'Checking Azure CLI login...'
         if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
@@ -1260,6 +1200,7 @@ function Set-Agent2ManualAuth {
         if ($currentTenant -ne $TenantId) {
             throw "Azure CLI is logged into tenant '$currentTenant', expected '$TenantId'."
         }
+        Assert-AzUserSession 'Step 4.4, setting the agent authentication to Custom Entra'
         Write-Info 'Azure CLI login ready.'
     }
 
@@ -1286,7 +1227,6 @@ function Set-Agent2ManualAuth {
 
     function Get-AzAccessTokenDetailed {
         param([Parameter(Mandatory)][string] $Mode, [Parameter(Mandatory)][string] $Value)
-        # $azArgs, not $args - that is an automatic variable.
         $azArgs = @('account', 'get-access-token', '--tenant', $TenantId,
                     '--query', 'accessToken', '--output', 'tsv', '--only-show-errors')
         switch ($Mode) {
@@ -1304,11 +1244,8 @@ function Set-Agent2ManualAuth {
         @{ Success = $false; Token = $null; Error = $raw }
     }
 
-    # --------------------------------------------------------------- discovery
     function Resolve-CopilotResource {
         Write-Info 'Discovering the Copilot Studio resource in the tenant...'
-        # TSV rather than JSON for app ids: Windows PowerShell 5.1 can flatten a
-        # JSON array property into one space-separated value.
         $searchNames = @('Power Virtual Agents', 'Power Virtual Agents Service', 'ccibotsprod', 'ccibots')
         $candidateAppIds = New-Object System.Collections.Generic.List[string]
 
@@ -1357,9 +1294,6 @@ function Set-Agent2ManualAuth {
                     if ($result.Success) {
                         try {
                             $claims = Decode-JwtPayload -Token $result.Token
-                            # Must be a DELEGATED token in the right tenant: an
-                            # app-only token (idtyp 'app') is rejected by the
-                            # gateway, and so is one from another tenant.
                             if ([string]$claims.tid -eq $TenantId -and
                                 -not [string]::IsNullOrWhiteSpace([string]$claims.oid) -and
                                 [string]$claims.idtyp -ne 'app') {
@@ -1400,7 +1334,6 @@ No authentication changes were made.
             -Uri 'https://api.powerplatform.com/environmentmanagement/environments?api-version=2024-10-01'
 
         $targetUrl = Normalize-Url $DataverseUrl
-        # $envMatches, not $matches - that is an automatic variable.
         $envMatches = @($response.value | Where-Object { (Normalize-Url $_.url) -eq $targetUrl })
 
         if ($envMatches.Count -eq 0) {
@@ -1421,10 +1354,6 @@ No authentication changes were made.
         Write-Info 'Discovering the Copilot Studio gateway...'
         $headers = @{ Authorization = "Bearer $BapToken"; Accept = 'application/json' }
 
-        # The BAP admin environment response carries properties.runtimeEndpoints,
-        # including microsoft.PowerVirtualAgents - the environment-specific PVA
-        # gateway. The global BAP host handles regional routing, so no regional
-        # endpoint has to be known up front.
         $listUri = "$BapApiBaseUrl/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments?api-version=2020-10-01&`$expand=properties"
         Write-Host '      querying BAP environment metadata...'
         $listResult = Invoke-JsonGet -Uri $listUri -Headers $headers -ReturnNullOnError
@@ -1443,8 +1372,6 @@ No authentication changes were made.
             }
         }
 
-        # The list response can be filtered or abbreviated; ask for the one
-        # environment directly instead.
         Write-Host '      BAP list did not expose the gateway. Trying direct environment metadata...'
         foreach ($uri in @(
             "$BapApiBaseUrl/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/$EnvironmentId?api-version=2016-11-01",
@@ -1487,7 +1414,6 @@ were made.
         $null
     }
 
-    # ----------------------------------------------------------------- headers
     function New-CopilotDiscoveryHeaders {
         param(
             [Parameter(Mandatory)][string] $Token,
@@ -1511,7 +1437,6 @@ were made.
             'x-ms-client-session-id'   = [guid]::NewGuid().ToString()
             'x-ms-client-tenant-id'    = [string]$Claims.tid
         }
-        # Without this the change lands in the Default solution only.
         if (-not [string]::IsNullOrWhiteSpace($SolutionUniqueName)) {
             $headers['x-ms-solution-unique-name'] = $SolutionUniqueName
         }
@@ -1534,7 +1459,6 @@ were made.
         $headers
     }
 
-    # --------------------------------------------------- internal routing bot id
     function Test-InternalBotId {
         param(
             [Parameter(Mandatory)][string] $Candidate,
@@ -1574,7 +1498,6 @@ were made.
         $discoveryHeaders = New-CopilotDiscoveryHeaders -Token $CopilotToken -Claims $CopilotClaims `
             -EnvironmentId $EnvironmentId -OrganizationId $OrganizationId -CdsBotId $CdsBotId
 
-        # Some environments resolve the bot without x-cci-botid at all.
         $withoutInternal = Invoke-CopilotRequest -Method GET -Uri $configurationUri `
             -Headers $discoveryHeaders -ReturnNullOnError
         if ($withoutInternal -and -not [string]::IsNullOrWhiteSpace([string]$withoutInternal.etag)) {
@@ -1582,8 +1505,6 @@ were made.
             return @{ InternalBotId = $null; Headers = $discoveryHeaders; Configuration = $withoutInternal }
         }
 
-        # Every GUID we already know is NOT the routing id, so exclude them and
-        # try what is left.
         $known = @(
             $EnvironmentId.ToLowerInvariant(), $OrganizationId.ToLowerInvariant(),
             $CdsBotId.ToLowerInvariant(), $TenantId.ToLowerInvariant(),
@@ -1594,8 +1515,6 @@ were made.
             if (-not $known.Contains($guid) -and -not $candidateIds.Contains($guid)) { $candidateIds.Add($guid) }
         }
 
-        # Bot metadata routes that can expose the routing id. This surface is not
-        # publicly documented, so every result is validated before being used.
         foreach ($uri in @(
             "$GatewayBaseUrl/api/botmanagement/v1/bots?environmentId=$EnvironmentId",
             "$GatewayBaseUrl/api/botmanagement/v1/environments/$EnvironmentId/bots",
@@ -1630,7 +1549,6 @@ No authentication changes were made.
 '@
     }
 
-    # ---------------------------------------------------------------- payloads
     function New-CreateConfigurationPayload {
         param([Parameter(Mandatory)][string] $Etag)
         @{
@@ -1697,7 +1615,6 @@ No authentication changes were made.
         }
     }
 
-    # -------------------------------------------------------------------- main
     Write-Info "tenant      $TenantId"
     Write-Info "environment $DataverseUrl"
     Write-Info "agent       $BotName"
@@ -1746,9 +1663,6 @@ No authentication changes were made.
     Write-Ok "discovery complete (gateway $gatewayBaseUrl)"
     Write-Info "current mode    $($current.authenticationMode)"
 
-    # Some environments return a partial authenticationConnection even when no
-    # usable connection exists yet - an empty name or settingId. That is a
-    # CREATE, not an UPDATE: a PUT with an invalid connection name fails.
     $existingConnection = $current.authenticationConnection
     $existingName       = if ($null -ne $existingConnection) { [string]$existingConnection.name }      else { '' }
     $existingSettingId  = if ($null -ne $existingConnection) { [string]$existingConnection.settingId } else { '' }
@@ -1777,7 +1691,6 @@ No authentication changes were made.
     }
     Write-Ok "$method configuration succeeded (connection $($configResult.authenticationConnection.name))"
 
-    # Trigger and access policy, which are separate from the connection itself.
     Invoke-CopilotRequest -Method POST -Headers $headers `
         -Uri "$gatewayBaseUrl/api/botauthoring/v1/environments/$environmentId/bots/$cdsBotId/auth/authorization" `
         -Body @{
@@ -1787,7 +1700,6 @@ No authentication changes were made.
         } | Out-Null
     Write-Ok 'authorization settings applied.'
 
-    # Read it back rather than trusting the write.
     $verify = Invoke-CopilotRequest -Method GET -Uri $configurationUri -Headers $headers
     $verifiedTenantId = Get-ParameterValue -Parameters $verify.authenticationConnection.parameters -Key 'tenantId'
 
@@ -1806,13 +1718,9 @@ No authentication changes were made.
     Write-Info "setting id      $($verify.authenticationConnection.settingId)"
 }
 
-# ==============================================================================
-# main
-# ==============================================================================
 try {
     Write-Stage 'Step 2 - Machine setup and CUA configuration'
 
-    # --- collect every input up front, so nothing prompts mid-run -------------
     $OrgUrl = ConvertTo-OrgUrl (Read-RequiredValue 'Target Dataverse org URL (https://org....crm.dynamics.com)' (Get-Fallback $OrgUrl 'OrgUrl'))
     if (-not $OrgUrl) { throw 'Could not read -OrgUrl as an org URL.' }
 
@@ -1857,9 +1765,6 @@ try {
     Write-Info "machine     $MachineName"
     Write-Info "connection  $ConnectionName"
 
-    # ==========================================================================
-    # 3.1  preflight and install
-    # ==========================================================================
     $groupId = $null
 
     if ($SkipRegistration) {
@@ -1873,8 +1778,6 @@ try {
         Test-WindowsEdition
         Test-Connectivity
 
-        # Is this box already registered? Answered from the local record, so it
-        # costs nothing and happens before anything is downloaded.
         $local = Get-LocalRegistration
         $alreadyRegistered = $false
         if ($local -and -not $Force) {
@@ -1901,7 +1804,6 @@ try {
             try     { Register-Machine -Secret $plain }
             finally { $plain = $null }
             Confirm-Runtime
-            # The machine group id only exists locally once registration has run.
             $local   = Get-LocalRegistration
             $groupId = if ($local) { $local.GroupId } else { $null }
         }
@@ -1909,9 +1811,6 @@ try {
         Enable-BrowserExtensions
     }
 
-    # ==========================================================================
-    # 3.2  enable the machine group for computer use
-    # ==========================================================================
     if ($SkipRegistration -and $SkipComputerUse) {
         Write-Stage '3.2  Computer use (skipped)'
     } else {
@@ -1928,7 +1827,6 @@ try {
         $groupId = Enable-ComputerUse -Token $appToken -GroupId $groupId
     }
 
-    # --- gate -----------------------------------------------------------------
     Write-Stage 'Gate - machine registered and grouped'
     if (-not $groupId) {
         throw 'No machine group id, so there is nothing for the Computer Use connection to bind to. Re-run with -Force to register this machine from scratch.'
@@ -1936,12 +1834,7 @@ try {
     Write-Ok "machine group $groupId"
     Write-Gate "Confirm '$MachineName' shows Online under Power Automate -> Monitor -> Machines."
 
-    # ==========================================================================
-    # 3.3  create the Computer Use connection
-    # ==========================================================================
     Write-Stage '3.3  Computer Use connection'
-    # Delegated from here on: a service principal cannot create or own one of
-    # these connections (code 10006), whatever Dataverse role it holds.
     $paToken = Get-DelegatedToken -Resource $PowerAppsScope
     $dvToken = Get-DelegatedToken -Resource $OrgUrl
     Write-Info 'Authenticated for the Power Apps and Dataverse APIs (delegated)'
@@ -1958,9 +1851,6 @@ try {
         finally { $plain = $null }
     }
 
-    # ==========================================================================
-    # 4.1 - 4.3  bind the connection into Agent 2's Computer Use action
-    # ==========================================================================
     if ($SkipBinding) {
         Write-Stage '4.1  Agent binding (skipped)'
     } else {
@@ -1968,9 +1858,6 @@ try {
         Set-AgentBinding -Token $dvToken -ConnectionId $connectionId
     }
 
-    # ==========================================================================
-    # 4.4  manual (Custom Entra) authentication
-    # ==========================================================================
     if ($SkipManualAuth) {
         Write-Stage '4.4  Manual authentication (skipped)'
         Write-Info 'Agent 2 keeps whatever authentication the imported solution set.'
@@ -1985,9 +1872,6 @@ try {
         }
         finally { $plain = $null }
 
-        # Changing an agent's authentication mode can discard its connections -
-        # switching OFF Custom Entra is known to. Setting it TO Custom Entra
-        # should not, but one call turns a silent breakage into an error.
         if (-not $SkipBinding) {
             Write-Stage 'Gate - binding survived the authentication change'
             Test-AgentBinding -Token $dvToken -ConnectionId $connectionId -Label 're-verified'

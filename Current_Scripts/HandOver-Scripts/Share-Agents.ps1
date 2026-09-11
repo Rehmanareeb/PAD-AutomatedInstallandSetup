@@ -111,7 +111,6 @@ param(
     [string]   $OrgUrl,
     [string[]] $Agent,
 
-    # --- grant, at most one ---------------------------------------------------
     [switch] $Everyone,
     [string] $UserEmail,
     [string] $RevokeUserEmail,
@@ -141,12 +140,7 @@ function Write-Stage { param([string] $m) Write-Host "`n=== $m" -ForegroundColor
 function Write-Info  { param([string] $m) Write-Host "    $m" }
 function Write-Ok    { param([string] $m) Write-Host "    $m" -ForegroundColor Green }
 
-# ==============================================================================
-# policy rules - pure, and the only thing -SelfTest can check without a tenant
-# ==============================================================================
 
-# Can a user SHARE take effect under the current policy?
-# Only the "nobody" state - group membership with no groups - is corrected.
 function Get-SharePolicyFix {
     param([int] $Policy, [string] $Groups)
     if ($Policy -eq 2 -and [string]::IsNullOrWhiteSpace($Groups)) { return @{ Set = 1; Warn = $null } }
@@ -156,8 +150,6 @@ function Get-SharePolicyFix {
     @{ Set = $null; Warn = $null }
 }
 
-# Can a user REVOKE take effect under the current policy?
-# Any / Any-multi-tenant lets everyone chat regardless of shares, so narrow it.
 function Get-RevokePolicyFix {
     param([int] $Policy, [string] $Groups)
     if ($Policy -eq 0 -or $Policy -eq 3) {
@@ -191,9 +183,6 @@ if ($SelfTest) {
     'ok'; return
 }
 
-# ==============================================================================
-# input
-# ==============================================================================
 function Read-RequiredValue {
     param([string] $Prompt, [string] $Value)
     while ([string]::IsNullOrWhiteSpace($Value)) { $Value = (Read-Host $Prompt).Trim() }
@@ -220,9 +209,6 @@ function Save-State {
 try {
     Write-Stage 'Step 3 - Share and publish the agents'
 
-    # Start from a real array. A pipeline that yields nothing gives $null, and
-    # $null += 'a' then += 'b' concatenates into ONE string whose .Count is 1, so
-    # a guard built that way never fires and two modes both run.
     $modes = @()
     if ($UserEmail)       { $modes += '-UserEmail' }
     if ($RevokeUserEmail) { $modes += '-RevokeUserEmail' }
@@ -233,9 +219,6 @@ try {
     $OrgUrl = (Read-RequiredValue 'Target Dataverse org URL (https://org....crm.dynamics.com)' (Get-Fallback $OrgUrl 'OrgUrl')).TrimEnd('/')
     if ($OrgUrl -notmatch '^https://') { throw "-OrgUrl must be an https org URL, got: $OrgUrl" }
 
-    # Accept 'a,b' and 'a b' as well as a real array. "pwsh -File script.ps1
-    # -Agent a,b" hands the whole thing over as ONE string, unlike a call from a
-    # prompt, so split either way and both invocations behave the same.
     if (-not $Agent -or $Agent.Count -eq 0) {
         if ($State.Agents) { $Agent = @($State.Agents) }
         else {
@@ -245,11 +228,9 @@ try {
     $Agent = @($Agent | ForEach-Object { $_ -split '[,\s]+' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if (-not $Agent.Count) { throw 'No agent schema names to act on.' }
 
-    # --- auth -----------------------------------------------------------------
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
         throw 'Azure CLI (az) not found - install from https://aka.ms/azure-cli and run `az login`.'
     }
-    # --query/-o tsv so the token never lands in a file or the process list.
     $token = az account get-access-token --resource $OrgUrl --query accessToken -o tsv 2>&1
     if ($LASTEXITCODE -ne 0 -or -not $token) {
         throw "az could not get a token for $OrgUrl. Run 'az login' in the same tenant as the environment.`n$token"
@@ -263,9 +244,6 @@ try {
         if ($null -ne $Body) { $call.Body = ($Body | ConvertTo-Json -Depth 6) }
         try { Invoke-RestMethod @call }
         catch {
-            # Dataverse explains itself in the body; the status code alone cannot
-            # tell "no privilege" from "no such row". PS 7 exposes it on
-            # ErrorDetails, 5.1 often only in the raw stream.
             $body = $_.ErrorDetails.Message
             if (-not $body) {
                 try {
@@ -304,9 +282,6 @@ try {
         $pac
     }
 
-    # ==========================================================================
-    # one agent: report, grant, publish
-    # ==========================================================================
     function Invoke-AgentStage {
         param([string] $Bot)
 
@@ -320,7 +295,6 @@ try {
 
         $target = @{ '@odata.id' = "bots($($row.botid))" }
 
-        # --- report only ------------------------------------------------------
         if ($modes.Count -eq 0) {
             Write-Info '  shared with'
             $principals = @(Get-SharedPrincipals $target)
@@ -335,18 +309,12 @@ try {
             return
         }
 
-        # --- everyone ---------------------------------------------------------
         if ($Everyone) {
             Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{ accesscontrolpolicy = 0; authorizedsecuritygroupids = $null } | Out-Null
             Write-Ok "policy set to 0 $($PolicyName[0])"
         }
 
-        # --- revoke everyone --------------------------------------------------
         if ($RevokeEveryone) {
-            # The mirror of -Everyone: withdraw the org-wide grant by moving the
-            # policy to Copilot readers. Individual row shares survive on purpose -
-            # they are separate grants, and clearing them is -RevokeUserEmail's
-            # job, one user at a time.
             Invoke-Dv "bots($($row.botid))" -Method Patch -Body @{ accesscontrolpolicy = 1; authorizedsecuritygroupids = $null } | Out-Null
             Write-Ok "org-wide access withdrawn. Policy set to 1 $($PolicyName[1])"
             $left = @(Get-SharedPrincipals $target | Where-Object { $_.Principal.'@odata.type' -match 'systemuser' })
@@ -359,15 +327,10 @@ try {
             }
         }
 
-        # --- one user ---------------------------------------------------------
         if ($UserEmail) {
             $user = Resolve-DvUser $UserEmail
             Write-Info "share with: $($user.fullname) <$($user.domainname)>"
 
-            # 1. prvReadbot, the privilege that lets the user see the agent at
-            #    all. Only grant a role if none of theirs already carries it -
-            #    Environment Maker is environment-wide, and Bot Author / Bot
-            #    Viewer / Agent Viewer carry it too.
             $userRoles  = (Invoke-Dv "systemusers($($user.systemuserid))/systemuserroles_association?`$select=name,roleid").value
             $prvReadBot = (Invoke-Dv "privileges?`$select=privilegeid&`$filter=name eq 'prvReadbot'").value[0].privilegeid
             $holder     = $userRoles | Where-Object {
@@ -383,14 +346,12 @@ try {
                 Write-Ok "  role   Environment Maker assigned - no existing role carried prvReadbot (had: $($userRoles.name -join ', '))"
             }
 
-            # 2. Read access on the agent row.
             Invoke-Dv 'GrantAccess' -Method Post -Body @{
                 Target          = $target
                 PrincipalAccess = @{ Principal = @{ '@odata.id' = "systemusers($($user.systemuserid))" }; AccessMask = 'ReadAccess' }
             } | Out-Null
             Write-Ok '  share  ReadAccess granted on the agent'
 
-            # 3. Policy, only if it would swallow the share.
             $fix = Get-SharePolicyFix -Policy ([int]$row.accesscontrolpolicy) -Groups $row.authorizedsecuritygroupids
             if ($fix.Warn) { Write-Warning $fix.Warn }
             if ($null -ne $fix.Set) {
@@ -401,12 +362,10 @@ try {
             }
         }
 
-        # --- revoke one user --------------------------------------------------
         if ($RevokeUserEmail) {
             $user = Resolve-DvUser $RevokeUserEmail
             Write-Info "revoke: $($user.fullname) <$($user.domainname)>"
 
-            # 1. Drop the row share, then prove it is gone.
             Invoke-Dv 'RevokeAccess' -Method Post -Body @{
                 Target  = $target
                 Revokee = @{ '@odata.id' = "systemusers($($user.systemuserid))" }
@@ -415,7 +374,6 @@ try {
             if ($still) { throw "RevokeAccess returned success but the share is still there: $($still.AccessMask)" }
             Write-Ok '  share  revoked on the agent'
 
-            # 2. Policy, if it would make the revoke meaningless.
             $fix = Get-RevokePolicyFix -Policy ([int]$row.accesscontrolpolicy) -Groups $row.authorizedsecuritygroupids
             if ($fix.Warn) { Write-Warning $fix.Warn }
             if ($null -ne $fix.Set) {
@@ -425,26 +383,18 @@ try {
                 Write-Info "  policy left at $($row.accesscontrolpolicy) $($PolicyName[[int]$row.accesscontrolpolicy])"
             }
 
-            # The environment role is deliberately left alone - it governs every
-            # agent here, not this one.
             Write-Info '  role   left as is. Environment Maker governs the whole environment, not this agent.'
         }
 
         $after = Invoke-Dv "bots($($row.botid))?`$select=accesscontrolpolicy,authorizedsecuritygroupids"
         Write-Info "now: policy=$($after.accesscontrolpolicy) $($PolicyName[[int]$after.accesscontrolpolicy]) $($after.authorizedsecuritygroupids)"
 
-        # --- publish ----------------------------------------------------------
         if ($NoPublish) {
             Write-Warning "NOT published (-NoPublish). Nothing above reaches the runtime until you run: pac copilot publish --environment $OrgUrl --bot $Bot"
             return
         }
 
         $pac = Resolve-Pac
-        # Publish by the agent's GUID, not its schema name. --bot takes either,
-        # but the id is already in hand and it skips a name lookup that has been
-        # seen to crash pac with System.ArgumentException on a freshly imported
-        # agent that has never been published. pac.cmd also does not propagate
-        # exit codes, so the proof of a publish is publishedon moving.
         $pubOut = & $pac copilot publish --environment $OrgUrl --bot $row.botid 2>&1 | ForEach-Object { "$_" }
         $pubOut | ForEach-Object { Write-Info $_ }
 
@@ -468,9 +418,6 @@ try {
         Write-Ok "published at $publishedon"
     }
 
-    # ==========================================================================
-    # every agent, in order
-    # ==========================================================================
     if ($modes.Count -eq 0) {
         Write-Info 'No grant given - reporting current access only, nothing will change.'
     }

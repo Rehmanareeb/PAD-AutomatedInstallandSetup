@@ -1,240 +1,4 @@
-<#
-.SYNOPSIS
-  The whole CUA deployment in one self-contained script: solution preparation,
-  machine and CUA configuration, then sharing and publishing.
 
-.DESCRIPTION
-  ONE FILE, ONE SET OF ANSWERS. Every input is collected up front, before
-  anything runs, and nothing stops halfway through to ask a question. This
-  script calls no other script - not in this folder, not in Current_Scripts - so
-  it can be handed over on its own.
-
-  Stage 1 - solution preparation (flow step 1)
-      1.1  download the solution package from an https URL
-      1.2  create the Azure Key Vault, assign RBAC, store the F&O credentials
-      1.3  unpack, retarget the SharePoint site and Dataverse org, point the Fno
-           environment variables at the vault secrets, repack
-      1.4  create the Dataverse and SharePoint connections, fill the deployment
-           settings file, import with it
-      GATE: the import must succeed.
-
-  Stage 2 - machine and CUA configuration (flow steps 3 and 4)
-      3.1  install Power Automate, register this machine
-      3.2  enable the machine group for computer use
-      3.3  create the Computer Use connection, verify its targetId
-      GATE: the machine is registered and grouped.
-      4.1  point Agent 2's Computer Use action at that connection
-      4.2  create or reuse the connection reference in the action's solution
-      4.3  repoint and verify action, row, connectionid and solution membership
-      4.4  set Agent 2's authentication to manual (Custom Entra), then
-           re-verify the binding
-
-  Stage 3 - share and publish (flow step 5)
-      5.1  share and publish Agent 1
-      5.2  share and publish Agent 2
-      5.3  end-to-end validation checklist
-
-  Flow step 2, provisioning the VM itself, happens before any of this.
-
-  STOPS ON THE FIRST FAILURE and names the stage, with the command to resume
-  from that point. Stage 2 must not run against a failed import, and stage 3 must
-  not publish an agent whose Computer Use binding never landed.
-
-  ORDER MATTERS. Each stage creates the object the next one binds to. Run stage 3
-  before stage 2 and you publish an agent whose tool has no machine.
-
-  AUTHENTICATION. Three operations need three different identities, and no single
-  credential covers all of them:
-    * Machine registration cannot use a token. The registration tool takes a
-      username, or an app id with a client secret piped over stdin - it
-      provisions a LOCAL machine identity, not a row you POST.
-    * Creating the Computer Use connection cannot be app-only. Authorisation
-      comes from the connectivity service, and these connections are created with
-      sharing disabled, so a service principal fails with code 10006 even holding
-      System Administrator.
-    * The first SharePoint connection in a new environment needs a person -
-      shared_sharepointonline publishes no service principal parameter set.
-    * Everything else is an ordinary delegated call off `az login`.
-
-  SECRETS are taken as SecureString, converted only at the moment of use, and
-  never written to disk or placed on a command line.
-
-  ENCODING. Every file rewritten between unpack and pack is UTF-8 WITHOUT a BOM,
-  written through .NET. Windows PowerShell 5.1 has no 'utf8NoBOM' encoding name,
-  and its -Encoding utf8 means UTF-8 WITH a BOM - which makes the import fail
-  with "Flow clientdata is in invalid format".
-
-.NOTES
-  STEP 4.4 TALKS TO UNDOCUMENTED ENDPOINTS. Copilot Studio publishes no supported
-  API for setting an agent's authentication, so that step discovers the Copilot
-  service principal, the environment, the PVA gateway and the internal routing
-  bot id at run time, validating each answer before using it. Nothing is written
-  until every piece of discovery succeeds, so a failure leaves the agent's
-  authentication exactly as it was. -SkipManualAuth skips it.
-
-  DO NOT CLONE THE VM once stage 2 has run. The registration and machine identity
-  do not survive it: the clone inherits a registration record pointing at a
-  machine it is not, which shows up later as a machine that registers and then
-  never comes online.
-
-  REQUIRES: `az login` and a `pac auth` profile, both in the same tenant as the
-  target environment, and Administrator for stage 2.
-
-.PARAMETER SkipPrepare
-  Do not run stage 1.
-
-.PARAMETER SkipMachine
-  Do not run stage 2.
-
-.PARAMETER SkipShare
-  Do not run stage 3.
-
-.PARAMETER OnlyPrepare
-  Run stage 1 alone.
-
-.PARAMETER OnlyMachine
-  Run stage 2 alone.
-
-.PARAMETER OnlyShare
-  Run stage 3 alone.
-
-.PARAMETER WhatIfStages
-  Print the stages that would run and every value collected, then stop without
-  touching anything. Use it to check a long command line before committing.
-
-.PARAMETER OrgUrl
-  Target Dataverse org URL, e.g. https://org35fd7a12.crm.dynamics.com
-
-.PARAMETER EnvironmentId
-  Power Platform environment GUID.
-
-.PARAMETER TenantId
-  Directory (tenant) id.
-
-.PARAMETER SolutionUrl
-  https URL serving the solution zip. Stage 1.
-
-.PARAMETER SolutionPath
-  Local solution zip, as an alternative to -SolutionUrl. Stage 1.
-
-.PARAMETER SharePointUrl
-  SharePoint site the solution's flow and file tool should point at. Stage 1.
-
-.PARAMETER SubscriptionId
-  Azure subscription holding the Key Vault. Stage 1.
-
-.PARAMETER ResourceGroupName
-  Resource group for the Key Vault, created if missing. Stage 1.
-
-.PARAMETER Location
-  Azure region, e.g. 'East US'. Stage 1.
-
-.PARAMETER KeyVaultName
-  Key Vault name, globally unique. Stage 1.
-
-.PARAMETER AllowedEnvironmentTag
-  AllowedEnvironments tag stamped on both secrets: a comma-separated list of
-  ENVIRONMENT ids, not the tenant id. Power Platform reads it to decide which
-  environments may resolve the secret. Defaults to -EnvironmentId. Passing the
-  tenant id is rejected - it produces a vault that looks correctly configured and
-  then fails to resolve at run time.
-
-.PARAMETER FnoUsername
-  F&O username stored in the vault. Stage 1.
-
-.PARAMETER FnoPassword
-  F&O password, SecureString. Stage 1.
-
-.PARAMETER DataverseAppId
-  App registration the new Dataverse connection signs in as. It must already be
-  an application user in the target environment. Stage 1.
-
-.PARAMETER DataverseAppSecret
-  Its client secret, SecureString. Stage 1.
-
-.PARAMETER ApplicationId
-  App registration used for silent machine registration and for the app-only
-  Dataverse call that enables computer use. Stage 2.
-
-.PARAMETER PadClientSecret
-  Its client secret, SecureString. Stage 2.
-
-.PARAMETER MachineName
-  Name this machine registers under. Defaults to $env:COMPUTERNAME. Stage 2.
-
-.PARAMETER MachineUsername
-  Windows account that signs in to the machine. Stage 2.
-
-.PARAMETER MachinePassword
-  That account's password, SecureString. Stage 2.
-
-.PARAMETER ConnectionName
-  Display name for the Computer Use connection. Defaults to '<MachineName>-CUA'.
-
-.PARAMETER AuthClientId
-  Entra app Agent 2 authenticates its users with. Different from -ApplicationId.
-  Stage 2, step 4.4.
-
-.PARAMETER AuthClientSecret
-  Its client secret, SecureString. Stage 2, step 4.4.
-
-.PARAMETER Agent1SchemaName
-.PARAMETER Agent2SchemaName
-.PARAMETER Agent2CuaComponentSchema
-.PARAMETER Agent2DisplayName
-  The agent identifiers. These ship with the solution and do not change between
-  environments, so they default to this solution's values and are never prompted
-  for. Override them only if the solution itself changes.
-
-.PARAMETER Everyone
-  Share both agents with the organisation. Stage 3. This is the default grant
-  when the sharing stage runs; pass -ReportOnly to change nothing.
-
-.PARAMETER UserEmail
-  Share with one user instead. Stage 3.
-
-.PARAMETER ReportOnly
-  Stage 3 reports current access and changes nothing.
-
-.PARAMETER SelfTest
-  Run every check that needs no tenant, and exit.
-
-.EXAMPLE
-  .\Run-HandOver.ps1 -OrgUrl https://org35fd7a12.crm.dynamics.com `
-                     -EnvironmentId 20bbbb76-91c1-efde-bf32-8a5468336104 `
-                     -TenantId edda99bb-bab6-4c4c-8aa1-4b99e8e09c1b `
-                     -SolutionUrl https://files.catbox.moe/abc123.zip `
-                     -SharePointUrl https://contoso.sharepoint.com/sites/AICOE `
-                     -SubscriptionId 0c33fa37-4fa1-466d-a891-46af9e2f6e44 `
-                     -ResourceGroupName rg-cua-uat -Location 'East US' `
-                     -KeyVaultName kv-cua-uat-01 `
-                     -ApplicationId <pad-app-guid> `
-                     -DataverseAppId <dv-app-guid> `
-                     -AuthClientId <auth-app-guid> `
-                     -MachineUsername CONTOSO\svc-cua
-
-  Full deployment. Prompts once, up front, for the four secrets.
-
-.EXAMPLE
-  .\Run-HandOver.ps1 -SkipPrepare -WhatIfStages
-
-  Show which stages would run and what values they would get, without doing
-  anything.
-
-.EXAMPLE
-  .\Run-HandOver.ps1 -OnlyShare -Everyone
-
-  The first two stages already ran - just share and publish both agents.
-
-.EXAMPLE
-  .\Run-HandOver.ps1 -SkipPrepare -Force
-
-  Re-register a machine whose registration record is stale - the usual fix after
-  a VM was cloned from an image that already had Power Automate registered.
-
-.EXAMPLE
-  .\Run-HandOver.ps1 -SelfTest
-#>
 [CmdletBinding()]
 param(
     [switch] $Help,
@@ -531,6 +295,66 @@ function Invoke-Az {
     ($out -join "`n").Trim()
 }
 
+function Get-AzSessionKind {
+    <#
+      What az is signed in as: 'user', 'servicePrincipal', or '' for no session.
+      `az account show --query user.type` is the only question both can answer -
+      `az ad signed-in-user show` throws for a service principal, which is the
+      case this exists to detect.
+    #>
+    $kind = ''
+    try { $kind = (& az account show --query user.type --output tsv --only-show-errors 2>$null | Out-String).Trim() }
+    catch { $kind = '' }
+    if ($LASTEXITCODE -ne 0) { $kind = '' }
+    $kind
+}
+
+function Get-AzCallerIdentity {
+    <#
+      The object id AND principal type of whoever az is signed in as. Both are
+      needed: `az role assignment create` wants --assignee-principal-type, and
+      the object id comes from a different call for each kind. Signed in with
+      --service-principal, `az ad signed-in-user show` fails with "not signed in
+      with a user account" - that one line is what used to stop the whole Key
+      Vault step running app-only.
+    #>
+    $kind = Get-AzSessionKind
+    if (-not $kind) { throw 'No Azure CLI session. Run: az login' }
+
+    if ($kind -eq 'servicePrincipal') {
+        $appId = Invoke-Az @('account', 'show', '--query', 'user.name', '--output', 'tsv') `
+            'Could not read the signed-in application id.'
+        $oid = Invoke-Az @('ad', 'sp', 'show', '--id', $appId, '--query', 'id', '--output', 'tsv') `
+            "Could not read the service principal for app $appId. An app-only session needs the Microsoft Graph APPLICATION permission Application.Read.All, granted with admin consent."
+        return @{ Id = $oid; Type = 'ServicePrincipal'; What = "app $appId" }
+    }
+
+    $oid = Invoke-Az @('ad', 'signed-in-user', 'show', '--query', 'id', '--output', 'tsv') `
+        'Could not read the signed-in Azure user. Run: az login'
+    @{ Id = $oid; Type = 'User'; What = 'you' }
+}
+
+function Assert-AzUserSession {
+    <#
+      Most of this script runs perfectly well signed in as a service principal.
+      Three things do not, and each fails deep and unhelpfully when one tries:
+        - the SharePoint connection - shared_sharepointonline publishes no
+          service principal parameter set, so there is nothing to authenticate
+        - the Computer Use connection - the connectivity service answers code
+          10006, because these connections are created with sharing disabled
+        - step 4.4 - the Copilot gateway rejects a token whose idtyp is 'app'
+      So say so here, before the call, instead of after it.
+    #>
+    param([Parameter(Mandatory)][string] $What)
+    $kind = Get-AzSessionKind
+    if (-not $kind) { throw 'No Azure CLI session. Run: az login' }
+    if ($kind -eq 'servicePrincipal') {
+        throw ("$What cannot be done by a service principal, and az is signed in as one. " +
+               'Sign in as a person for this step (az login), or skip it and reuse an existing ' +
+               "object. See 'Where app-only does not work' in README.md.")
+    }
+}
+
 function New-SecretReference {
     param([string] $Subscription, [string] $ResourceGroup, [string] $Vault, [string] $Secret)
     "/subscriptions/$Subscription/resourceGroups/$ResourceGroup/providers/Microsoft.KeyVault/vaults/$Vault/secrets/$Secret"
@@ -752,12 +576,14 @@ function New-FnoKeyVault {
     Write-Info "vault id $vaultId"
 
     # --- role assignments -----------------------------------------------------
-    $currentUser = Invoke-Az @('ad', 'signed-in-user', 'show', '--query', 'id', '--output', 'tsv') `
-        'Could not read the signed-in Azure user. Run: az login'
+    # Works signed in as a person or as a service principal - see
+    # Get-AzCallerIdentity for why that needs two different calls.
+    $caller = Get-AzCallerIdentity
+    Write-Info "caller $($caller.What) [$($caller.Type)]"
 
     $assignments = @(
-        @{ Id = $currentUser; Type = 'User'; Role = 'Key Vault Secrets Officer'; What = 'you (to write the secrets)' }
-        @{ Id = $currentUser; Type = 'User'; Role = 'Key Vault Secrets User';    What = 'you (to read them back)' }
+        @{ Id = $caller.Id; Type = $caller.Type; Role = 'Key Vault Secrets Officer'; What = "$($caller.What) (to write the secrets)" }
+        @{ Id = $caller.Id; Type = $caller.Type; Role = 'Key Vault Secrets User';    What = "$($caller.What) (to read them back)" }
     )
 
     # Copilot Studio and Dataverse both resolve the secret at run time, so both
@@ -1407,6 +1233,7 @@ function Set-SolutionConnections {
         # consented to by a person. What can be automated is everything around
         # that: the shell, the consent link and the polling. The human part is
         # one sign-in, usually one click.
+        Assert-AzUserSession 'Creating the first SharePoint connection in an environment'
         $newSpId = 'shared-sharepointonl-' + [Guid]::NewGuid().ToString()
         $spUrl   = 'https://api.powerapps.com/providers/Microsoft.PowerApps/apis/' +
                    "shared_sharepointonline/connections/${newSpId}?api-version=2016-11-01" + $envFilter
@@ -1978,6 +1805,11 @@ function New-CuaConnection {
     #>
     param([string] $PowerAppsToken, [string] $GroupId, [string] $Username, [string] $Password)
 
+    # Guarded here and not in Get-DelegatedToken: the token itself is fine
+    # app-only and the 4.1-4.3 binding writes work with it. It is this PUT,
+    # and only this PUT, that the connectivity service refuses with code 10006.
+    Assert-AzUserSession 'Creating the Computer Use connection'
+
     $connectionId = (New-Guid).Guid.Replace('-', '')
     Write-Info "New connection id: $connectionId"
 
@@ -2385,6 +2217,9 @@ function Set-Agent2ManualAuth {
         if ($currentTenant -ne $TenantId) {
             throw "Azure CLI is logged into tenant '$currentTenant', expected '$TenantId'."
         }
+        # An app-only session gets this far and then fails much later, at the
+        # gateway's idtyp check, with nothing to point at. Fail here instead.
+        Assert-AzUserSession 'Step 4.4, setting the agent authentication to Custom Entra'
         Write-Info 'Azure CLI login ready.'
     }
 

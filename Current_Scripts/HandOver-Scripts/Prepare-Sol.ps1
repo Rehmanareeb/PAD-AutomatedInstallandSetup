@@ -181,13 +181,11 @@
 param(
     [switch] $Help,
 
-    # --- solution source -------------------------------------------------------
     [string] $SolutionUrl,
     [string] $SolutionPath,
     [string] $OutFile,
     [string] $KeepSource,
 
-    # --- target ---------------------------------------------------------------
     [string] $OrgUrl,
     [string] $EnvironmentId,
     [string] $SharePointUrl,
@@ -196,7 +194,6 @@ param(
     [ValidateSet('Unmanaged', 'Managed', 'Both')]
     [string] $PackageType = 'Unmanaged',
 
-    # --- Azure Key Vault ------------------------------------------------------
     [string] $SubscriptionId,
     [string] $ResourceGroupName,
     [string] $Location,
@@ -212,9 +209,6 @@ param(
     [string] $FnoPasswordSecretUri,
     [switch] $SkipFno,
 
-    # --- solution-internal names ---------------------------------------------
-    # Properties of the package rather than of an environment, so they only
-    # change if the solution changes.
     [ValidateNotNullOrEmpty()]
     [string] $SharePointSiteVariable    = 'cre44_SharePointSiteUrl',
     [ValidateNotNullOrEmpty()]
@@ -228,14 +222,12 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $DataverseToolPattern      = '*Agent1TestScript.action.MicrosoftDataverse-Addanewrowtoselectedenvironment',
 
-    # --- SharePoint library lookup, app-only Graph ----------------------------
     [switch] $ResolveLibraryId,
     [string] $Library,
     [string] $ClientId,
     [string] $TenantId,
     [securestring] $ClientSecret,
 
-    # --- connections ----------------------------------------------------------
     [string]   $DataverseAppId,
     [string]   $DataverseTenantId,
     [securestring] $DataverseAppSecret,
@@ -248,7 +240,6 @@ param(
     [int]      $ConsentTimeoutSeconds = 300,
     [string]   $SettingsFile,
 
-    # --- stage control --------------------------------------------------------
     [switch] $SkipKeyVault,
     [switch] $SkipCreateDataverse,
     [switch] $SkipCreateSharePoint,
@@ -269,13 +260,7 @@ function Write-Info  { param([string] $m) Write-Host "    $m" }
 function Write-Ok    { param([string] $m) Write-Host "    $m" -ForegroundColor Green }
 function Write-Gate  { param([string] $m) Write-Host "    GATE  $m" -ForegroundColor Green }
 
-# ==============================================================================
-# pure helpers - what -SelfTest can check without a tenant
-# ==============================================================================
 
-# Dataverse rejects a secret-type value that does not match this. Anchored, so
-# trailing junk fails here rather than at import time with the useless message
-# "This variable didn't save properly."
 $SecretRefPattern = '(?i)^/subscriptions/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/resourcegroups/(.+?)/providers/Microsoft\.KeyVault/(.+?)/secrets/(.+)$'
 $SecretRefHint    = 'Valid format: /subscriptions/<guid>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<vault>/secrets/<secret>'
 
@@ -286,7 +271,7 @@ function ConvertFrom-PacConnectionList {
     foreach ($line in $Lines) {
         $t = ($line -split '\s+') | Where-Object { $_ }
         if ($t.Count -lt 4) { continue }
-        if ($t[-2] -notmatch '^/providers/Microsoft\.PowerApps/apis/') { continue }   # skips the header
+        if ($t[-2] -notmatch '^/providers/Microsoft\.PowerApps/apis/') { continue }
         $out += [pscustomobject]@{
             Id        = $t[0]
             Connector = $t[-2] -replace '^.*/', ''
@@ -366,9 +351,6 @@ if ($SelfTest) {
     'ok'; return
 }
 
-# ==============================================================================
-# input
-# ==============================================================================
 function Read-RequiredValue {
     param([string] $Prompt, [string] $Value)
     while ([string]::IsNullOrWhiteSpace($Value)) { $Value = (Read-Host $Prompt).Trim() }
@@ -387,10 +369,6 @@ function ConvertFrom-Secure {
     [Net.NetworkCredential]::new('', $Secure).Password
 }
 
-# Windows PowerShell 5.1 has no 'utf8NoBOM' encoding name, and its -Encoding utf8
-# means UTF-8 WITH a BOM, which makes pac and the import choke. Write through
-# .NET, which behaves the same on 5.1 and 7. The trailing newline keeps output
-# byte-identical to what the earlier runs produced.
 function Set-Utf8NoBom {
     param([string] $LiteralPath, [string] $Value)
     [System.IO.File]::WriteAllText($LiteralPath, $Value + [Environment]::NewLine,
@@ -410,9 +388,6 @@ function Resolve-Pac {
     throw 'pac (Power Platform CLI) not found. Install it with: winget install Microsoft.PowerPlatformCLI'
 }
 
-# Everything downstream unpacks and imports this file, so prove it really is a
-# zip. PK\x03\x04 is the local file header of every zip; a link that 404s saves
-# the HTML error page under a .zip name.
 function Test-ZipSignature {
     param([string] $File)
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { return $false }
@@ -435,7 +410,66 @@ function Invoke-Az {
     ($out -join "`n").Trim()
 }
 
-# --- state carried between the hand-over steps -------------------------------
+function Get-AzSessionKind {
+    <#
+      What az is signed in as: 'user', 'servicePrincipal', or '' for no session.
+      `az account show --query user.type` is the only question both can answer -
+      `az ad signed-in-user show` throws for a service principal, which is the
+      case this exists to detect.
+    #>
+    $kind = ''
+    try { $kind = (& az account show --query user.type --output tsv --only-show-errors 2>$null | Out-String).Trim() }
+    catch { $kind = '' }
+    if ($LASTEXITCODE -ne 0) { $kind = '' }
+    $kind
+}
+
+function Get-AzCallerIdentity {
+    <#
+      The object id AND principal type of whoever az is signed in as. Both are
+      needed: `az role assignment create` wants --assignee-principal-type, and
+      the object id comes from a different call for each kind. Signed in with
+      --service-principal, `az ad signed-in-user show` fails with "not signed in
+      with a user account" - that one line is what used to stop the whole Key
+      Vault step running app-only.
+    #>
+    $kind = Get-AzSessionKind
+    if (-not $kind) { throw 'No Azure CLI session. Run: az login' }
+
+    if ($kind -eq 'servicePrincipal') {
+        $appId = Invoke-Az @('account', 'show', '--query', 'user.name', '--output', 'tsv') `
+            'Could not read the signed-in application id.'
+        $oid = Invoke-Az @('ad', 'sp', 'show', '--id', $appId, '--query', 'id', '--output', 'tsv') `
+            "Could not read the service principal for app $appId. An app-only session needs the Microsoft Graph APPLICATION permission Application.Read.All, granted with admin consent."
+        return @{ Id = $oid; Type = 'ServicePrincipal'; What = "app $appId" }
+    }
+
+    $oid = Invoke-Az @('ad', 'signed-in-user', 'show', '--query', 'id', '--output', 'tsv') `
+        'Could not read the signed-in Azure user. Run: az login'
+    @{ Id = $oid; Type = 'User'; What = 'you' }
+}
+
+function Assert-AzUserSession {
+    <#
+      Most of this script runs perfectly well signed in as a service principal.
+      Three things do not, and each fails deep and unhelpfully when one tries:
+        - the SharePoint connection - shared_sharepointonline publishes no
+          service principal parameter set, so there is nothing to authenticate
+        - the Computer Use connection - the connectivity service answers code
+          10006, because these connections are created with sharing disabled
+        - step 4.4 - the Copilot gateway rejects a token whose idtyp is 'app'
+      So say so here, before the call, instead of after it.
+    #>
+    param([Parameter(Mandatory)][string] $What)
+    $kind = Get-AzSessionKind
+    if (-not $kind) { throw 'No Azure CLI session. Run: az login' }
+    if ($kind -eq 'servicePrincipal') {
+        throw ("$What cannot be done by a service principal, and az is signed in as one. " +
+               'Sign in as a person for this step (az login), or skip it and reuse an existing ' +
+               "object. See 'Where app-only does not work' in README.md.")
+    }
+}
+
 $StatePath = Join-Path $PSScriptRoot 'handover-state.json'
 $State = if (Test-Path -LiteralPath $StatePath) {
     Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
@@ -453,9 +487,6 @@ function Save-State {
     Write-Info "state    $StatePath"
 }
 
-# ==============================================================================
-# 1.2  Azure Key Vault
-# ==============================================================================
 function New-FnoKeyVault {
     <#
       Creates the resource group and vault if missing, gives the current user and
@@ -507,18 +538,14 @@ function New-FnoKeyVault {
     }
     Write-Info "vault id $vaultId"
 
-    # --- role assignments -----------------------------------------------------
-    $currentUser = Invoke-Az @('ad', 'signed-in-user', 'show', '--query', 'id', '--output', 'tsv') `
-        'Could not read the signed-in Azure user. Run: az login'
+    $caller = Get-AzCallerIdentity
+    Write-Info "caller $($caller.What) [$($caller.Type)]"
 
     $assignments = @(
-        @{ Id = $currentUser; Type = 'User'; Role = 'Key Vault Secrets Officer'; What = 'you (to write the secrets)' }
-        @{ Id = $currentUser; Type = 'User'; Role = 'Key Vault Secrets User';    What = 'you (to read them back)' }
+        @{ Id = $caller.Id; Type = $caller.Type; Role = 'Key Vault Secrets Officer'; What = "$($caller.What) (to write the secrets)" }
+        @{ Id = $caller.Id; Type = $caller.Type; Role = 'Key Vault Secrets User';    What = "$($caller.What) (to read them back)" }
     )
 
-    # Copilot Studio and Dataverse both resolve the secret at run time, so both
-    # need to read it. The Copilot service principal has been renamed once, hence
-    # the fallback.
     $copilotSp = Invoke-Az @('ad', 'sp', 'list', '--filter', "displayName eq 'Microsoft Copilot Studio Service'",
                              '--query', '[0].id', '--output', 'tsv') 'Could not query service principals.' -AllowFailure
     if ([string]::IsNullOrWhiteSpace($copilotSp)) {
@@ -531,7 +558,6 @@ function New-FnoKeyVault {
     }
     $assignments += @{ Id = $copilotSp; Type = 'ServicePrincipal'; Role = 'Key Vault Secrets User'; What = 'Copilot Studio' }
 
-    # Microsoft's first-party Dataverse app id - the same in every tenant.
     $dataverseSp = Invoke-Az @('ad', 'sp', 'list', '--filter', "appId eq '00000007-0000-0000-c000-000000000000'",
                                '--query', '[0].id', '--output', 'tsv') 'Could not query the Dataverse service principal.'
     if ([string]::IsNullOrWhiteSpace($dataverseSp)) { throw 'The Dataverse service principal could not be found.' }
@@ -551,9 +577,6 @@ function New-FnoKeyVault {
         Write-Ok "$($a.Role) assigned to $($a.What)"
     }
 
-    # --- secrets --------------------------------------------------------------
-    # The value goes in through a temp file, so it is never an argument in the
-    # process list. RBAC propagation is eventually consistent, hence the retries.
     foreach ($s in @(
         @{ Name = $UsernameSecret; Value = $Username }
         @{ Name = $PasswordSecret; Value = $Password }
@@ -580,9 +603,6 @@ function New-FnoKeyVault {
     }
 }
 
-# ==============================================================================
-# 1.3  solution: retarget, point the env vars at the vault, repack
-# ==============================================================================
 function Get-GraphTokenAppOnly {
     param([string] $Tenant, [string] $App, [string] $Secret)
     $body = @{
@@ -613,7 +633,6 @@ function Resolve-SharePointLibraryId {
                'With an app-only token a 403 almost always means Sites.Read.All is missing as an APPLICATION permission, or admin consent was never granted.')
     }
     $lists = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists?`$select=id,displayName,name" -Headers $h
-    # 'name' is the URL segment ('Shared Documents'), 'displayName' the title ('Documents')
     $hit = @($lists.value | Where-Object { $_.name -eq $LibraryName -or $_.displayName -eq $LibraryName })
     if ($hit.Count -eq 0) {
         throw ("No library '$LibraryName' on $SiteUrl. Available:`n" +
@@ -648,7 +667,7 @@ function Set-ToolInput {
     $inInputs = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match '^inputs:\s*$') { $inInputs = $true; continue }
-        if ($inInputs -and $lines[$i] -match '^\S') { break }   # next top-level key
+        if ($inInputs -and $lines[$i] -match '^\S') { break }
         if ($inInputs -and $lines[$i] -match ('^\s*propertyName:\s*' + [regex]::Escape($Prop) + '\s*$')) {
             for ($j = $i + 1; $j -lt [Math]::Min($i + 4, $lines.Count); $j++) {
                 if ($lines[$j] -match '^(\s*)value:\s*.*$') {
@@ -691,10 +710,6 @@ function Set-FnoEnvVar {
     $old = $node.InnerText
     $node.InnerText = $value
 
-    # Save through an XmlWriter pinned to UTF-8 without a BOM. NOT $xml.Save(path),
-    # which emits a BOM, and emphatically not $xml.Save(StringWriter), which stamps
-    # the declaration encoding="utf-16" and makes pac fail with "There is no
-    # Unicode byte order mark. Cannot switch to Unicode."
     $settings = New-Object System.Xml.XmlWriterSettings
     $settings.Encoding = New-Object System.Text.UTF8Encoding $false
     $settings.Indent   = $true
@@ -711,7 +726,6 @@ function Invoke-SolutionStage {
         [string] $KeepAt, [string] $GraphToken,
         [bool] $DoFno, [string] $FnoUser, [string] $FnoPass
     )
-    # The logic below was written under StrictMode; keep it scoped to this stage.
     Set-StrictMode -Version Latest
 
     $pac      = Resolve-Pac
@@ -727,13 +741,10 @@ function Invoke-SolutionStage {
         if ($LASTEXITCODE -ne 0) { throw "pac solution unpack failed (exit $LASTEXITCODE)" }
         Write-Info "unpacked $((Get-ChildItem -LiteralPath $work -Recurse -File).Count) files"
 
-        # What the package actually contains decides which agents get shared
-        # later, so nothing has to hardcode an agent name.
         $script:PackagedBots = @(Get-ChildItem -LiteralPath (Join-Path $work 'bots') -Directory |
                                  Select-Object -ExpandProperty Name)
         Write-Info "agents in package: $($script:PackagedBots -join ', ')"
 
-        # --- the CSV flow: SharePoint site, and optionally the library id -----
         $flow = @(Get-ChildItem -LiteralPath (Join-Path $work 'Workflows') -Filter $CsvFlowPattern -File)
         if ($flow.Count -ne 1) {
             throw "Expected exactly one flow matching '$CsvFlowPattern', found $($flow.Count). Pass -CsvFlowPattern if the solution's flow was renamed."
@@ -747,8 +758,6 @@ function Invoke-SolutionStage {
             $siteValue = Add-FlowParameter -Definition $defn -Name $SharePointSiteVariable -Value $SiteUrl
         }
         else {
-            # literal is the inverse of envvar: drop any environment variable
-            # declarations so re-running over an envvar package comes out clean.
             $siteValue = $SiteUrl
             foreach ($p in @($defn.parameters.PSObject.Properties.Name | Where-Object { $_ -notlike '$*' })) {
                 $defn.parameters.PSObject.Properties.Remove($p)
@@ -761,13 +770,11 @@ function Invoke-SolutionStage {
         foreach ($actionName in $defn.actions.PSObject.Properties.Name) {
             $action = $defn.actions.$actionName
             $inputs = $action.inputs
-            # Compose actions carry a plain string in .inputs, not an object.
             if ($inputs -is [string] -or $null -eq $inputs) { continue }
             if ($inputs.PSObject.Properties.Name -notcontains 'parameters') { continue }
             $p     = $inputs.parameters
             $names = $p.PSObject.Properties.Name
 
-            # Remember the library the flow writes into, e.g. '/Shared Documents/Test Cases'.
             if (-not $folderHint -and $names -contains 'folderPath' -and
                 $p.folderPath -is [string] -and $p.folderPath.StartsWith('/')) {
                 $folderHint = $p.folderPath
@@ -776,7 +783,6 @@ function Invoke-SolutionStage {
 
             if ($names -notcontains 'dataset') { continue }
             $cur = $p.dataset
-            # Match either form we may have written before.
             if ($cur -is [string] -and ($cur -like '*sharepoint.com*' -or $cur -like '@parameters(*')) {
                 $p.dataset = $siteValue
                 $n++
@@ -816,7 +822,6 @@ function Invoke-SolutionStage {
         Set-Utf8NoBom -LiteralPath $flowPath -Value ($json | ConvertTo-Json -Depth 100)
         $changes.Add("flow: set $n SharePoint site value(s) in $($flow[0].Name)")
 
-        # --- the two agent tools ---------------------------------------------
         $tools = @(
             @{ Glob = $SharePointToolPattern; Prop = 'dataset';      Literal = $SiteUrl
                Ev = $SharePointSiteVariable;  Label = 'SharePoint file tool' }
@@ -840,7 +845,6 @@ function Invoke-SolutionStage {
             }
         }
 
-        # --- envvar mode: define the variables and link the tools -------------
         if ($PackMode -eq 'envvar') {
             $defs = @(
                 @{ Name = $SharePointSiteVariable; Value = $SiteUrl;      Display = 'SharePoint Site URL' }
@@ -868,8 +872,6 @@ function Invoke-SolutionStage {
             }
 
             $linkFile = Join-Path $work 'Assets\botcomponent_environmentvariabledefinitionset.xml'
-            # Solutions with no env-var-using component yet have no link file at
-            # all, so start one.
             if ($evLinks.Count -and -not (Test-Path -LiteralPath $linkFile)) {
                 New-Item -ItemType Directory -Path (Split-Path -Parent $linkFile) -Force | Out-Null
                 Set-Utf8NoBom -LiteralPath $linkFile `
@@ -896,7 +898,6 @@ function Invoke-SolutionStage {
             }
         }
 
-        # --- drop search config for app modules the package does not ship ------
         $cust = @(
             (Join-Path $work 'Other\Customizations.xml')
             (Join-Path $work 'customizations.xml')
@@ -949,7 +950,6 @@ function Invoke-SolutionStage {
         }
         if (-not $removedAny) { $changes.Add('import fix: nothing to remove (no orphaned app search config)') }
 
-        # --- Fno credentials: Key Vault secret REFERENCES, never values -------
         if ($DoFno) {
             $manifest = Join-Path $work 'Other\Solution.xml'
             if (-not (Test-Path -LiteralPath $manifest)) {
@@ -982,9 +982,6 @@ function Invoke-SolutionStage {
 "@
                 Set-Utf8NoBom -LiteralPath (Join-Path $dir 'environmentvariabledefinition.xml') -Value $evXml
 
-                # Writing the file is not enough. A component not listed in
-                # Solution.xml RootComponents is carried in the zip and then
-                # ignored by the import. 380 is Environment Variable Definition.
                 $sx = Get-Content -LiteralPath $manifest -Raw
                 if ($sx -notmatch [regex]::Escape("schemaName=`"$schema`"")) {
                     $sx = $sx -replace '(\s*)</RootComponents>',
@@ -1000,14 +997,9 @@ function Invoke-SolutionStage {
             foreach ($t in $touched) { $changes.Add("fno: $($t.SchemaName) -> $($t.NewValue)") }
         }
 
-        # --- pack -------------------------------------------------------------
         if (Test-Path -LiteralPath $Out) { Remove-Item -LiteralPath $Out -Force }
         & $pac solution pack --zipfile $Out --folder $work --packagetype $PackType
         if ($LASTEXITCODE -ne 0) { throw "pac solution pack failed (exit $LASTEXITCODE)" }
-        # pac.cmd does not propagate exit codes, so a failed pack returns 0 and
-        # the run would carry on and "import" a file that was never written. The
-        # zip existing is the only honest proof. Long paths are the usual cause:
-        # pac is still limited to 260 characters.
         if (-not (Test-Path -LiteralPath $Out)) {
             throw ("pac solution pack reported success but $Out does not exist. " +
                    'Check the output above - a path over 260 characters is the usual cause.')
@@ -1027,9 +1019,6 @@ function Invoke-SolutionStage {
     }
 }
 
-# ==============================================================================
-# 1.4  connections, deployment settings, import
-# ==============================================================================
 function Set-SolutionConnections {
     <#
       Platform already has the binding mechanism - the deployment settings file
@@ -1056,10 +1045,8 @@ function Set-SolutionConnections {
 
     $pac = Resolve-Pac
 
-    # --- the references the solution declares --------------------------------
     if (Test-Path -LiteralPath $Settings) { Remove-Item -LiteralPath $Settings -Force }
     & $pac solution create-settings --solution-zip $Zip --settings-file $Settings 2>&1 | ForEach-Object { Write-Info $_ }
-    # pac.cmd returns 0 even where it printed an error, so prove the file instead.
     if (-not (Test-Path -LiteralPath $Settings)) {
         throw "pac solution create-settings reported success but $Settings is not there."
     }
@@ -1069,10 +1056,6 @@ function Set-SolutionConnections {
     if (-not $refs) { throw 'The solution declares no connection references - nothing to bind.' }
     Write-Info "$($refs.Count) connection reference(s) in the solution."
 
-    # create-settings writes "Value": "" for every environment variable, and the
-    # import then rejects its own file with "Environment variable value can't be
-    # an empty string". An absent entry is fine - the value baked into the
-    # solution is used - so drop the blanks rather than inventing values.
     $vars  = @($settingsObj.EnvironmentVariables)
     $empty = @($vars | Where-Object { -not $_.Value })
     if ($empty) {
@@ -1081,7 +1064,6 @@ function Set-SolutionConnections {
                     ($empty.SchemaName -join ', '))
     }
 
-    # --- create connections ---------------------------------------------------
     $paHeaders = $null
     $envFilter = $null
     if ($DoDataverse -or $DoSharePoint) {
@@ -1093,9 +1075,6 @@ function Set-SolutionConnections {
         $paHeaders = @{ Authorization = "Bearer $paToken"; Accept = 'application/json' }
 
         if (-not $EnvId) {
-            # instanceApiUrl is https://org65efd8ed.api.crm.dynamics.com while
-            # callers pass https://org65efd8ed.crm.dynamics.com, so match on the
-            # org name only.
             $org = ([uri]$EnvironmentUrl).Host -replace '\..*$', ''
             $all = (Invoke-RestMethod -Headers $paHeaders `
                         -Uri 'https://api.powerapps.com/providers/Microsoft.PowerApps/environments?api-version=2016-11-01').value
@@ -1107,8 +1086,6 @@ function Set-SolutionConnections {
         }
         Write-Info "environment $EnvId"
 
-        # Every connection call wants this filter; without it the API answers
-        # MissingEnvironmentFilter.
         $envFilter = '&%24filter=' + [uri]::EscapeDataString("environment eq '$EnvId'")
     }
 
@@ -1119,8 +1096,6 @@ function Set-SolutionConnections {
         if (-not $AppSecret) { throw 'Creating the Dataverse connection needs -DataverseAppSecret.' }
 
         $newId = (New-Guid).Guid.Replace('-', '')
-        # The braces around $newId are load-bearing: '?' is legal in a PowerShell
-        # variable name, so "$newId?api-version" reads as an empty variable.
         $url = 'https://api.powerapps.com/providers/Microsoft.PowerApps/apis/' +
                "shared_commondataserviceforapps/connections/${newId}?api-version=2016-11-01" + $envFilter
 
@@ -1152,8 +1127,6 @@ function Set-SolutionConnections {
             throw "Creating the connection failed: $($_.Exception.Message)`n$detail"
         }
 
-        # A bad secret still yields 201, with the failure only in statuses, so
-        # read back rather than trusting the PUT.
         $made   = Invoke-RestMethod -Uri $url -Headers $paHeaders
         $status = $made.properties.statuses | Select-Object -First 1
         if ($status.status -ne 'Connected') {
@@ -1165,10 +1138,7 @@ function Set-SolutionConnections {
 
     if ($DoSharePoint) {
         Write-Info 'Creating a SharePoint connection...'
-        # SharePoint has no service principal option, so the connection has to be
-        # consented to by a person. What can be automated is everything around
-        # that: the shell, the consent link and the polling. The human part is
-        # one sign-in, usually one click.
+        Assert-AzUserSession 'Creating the first SharePoint connection in an environment'
         $newSpId = 'shared-sharepointonl-' + [Guid]::NewGuid().ToString()
         $spUrl   = 'https://api.powerapps.com/providers/Microsoft.PowerApps/apis/' +
                    "shared_sharepointonline/connections/${newSpId}?api-version=2016-11-01" + $envFilter
@@ -1182,9 +1152,6 @@ function Set-SolutionConnections {
         Invoke-RestMethod -Method Put -Uri $spUrl -Headers $paHeaders -ContentType 'application/json' -Body $spBody | Out-Null
         Write-Info "created $newSpId unauthenticated, asking for a consent link"
 
-        # Signing in at the consent link is what authenticates the connection;
-        # the portal's follow-up confirmConsentCode call is bookkeeping, not a
-        # requirement. So there is nothing to catch - ask the service, and poll.
         $redirect = 'https://make.powerapps.com/connection/oauth/redirect?oauthPopupId=' + [Guid]::NewGuid()
         $linkUrl  = 'https://api.powerapps.com/providers/Microsoft.PowerApps/apis/' +
                     "shared_sharepointonline/connections/$newSpId/getConsentLink?api-version=2016-11-01" + $envFilter
@@ -1215,7 +1182,6 @@ function Set-SolutionConnections {
         $Pins['shared_sharepointonline'] = $newSpId
     }
 
-    # --- what exists in the target -------------------------------------------
     $listed = & $pac connection list --environment $EnvironmentUrl 2>&1 | ForEach-Object { "$_" }
     $conns  = @(ConvertFrom-PacConnectionList $listed)
     if (-not $conns) {
@@ -1224,7 +1190,6 @@ function Set-SolutionConnections {
     }
     $conns | Group-Object Connector | ForEach-Object { Write-Info "$($_.Name): $($_.Count) connection(s)" }
 
-    # --- bind -----------------------------------------------------------------
     foreach ($r in $refs) {
         $connector = $r.ConnectorId -replace '^.*/', ''
 
@@ -1257,9 +1222,6 @@ then run this again.
             continue
         }
 
-        # Several match. Guessing here binds the agent to whichever connection
-        # the API happened to return first, which is how a tool ends up reading
-        # the wrong site, so ask instead.
         Write-Host "`n    $($r.LogicalName)"
         Write-Host "    $($candidates.Count) '$connector' connections match:"
         for ($i = 0; $i -lt $candidates.Count; $i++) {
@@ -1277,13 +1239,10 @@ then run this again.
     $blank = @($refs | Where-Object { -not $_.ConnectionId })
     if ($blank) { throw "Still unbound: $($blank.LogicalName -join ', ')" }
 
-    # UTF-8 without a BOM: pac reads this file as JSON and a BOM has bitten this
-    # pipeline before.
     [System.IO.File]::WriteAllText($Settings, ($settingsObj | ConvertTo-Json -Depth 20),
                                    (New-Object System.Text.UTF8Encoding $false))
     Write-Ok "wrote $Settings"
 
-    # --- import ---------------------------------------------------------------
     if (-not $DoImport) {
         Write-Info "Import skipped. Import with:  pac solution import --environment $EnvironmentUrl --path $Zip --settings-file $Settings"
         return
@@ -1294,8 +1253,6 @@ then run this again.
                 --activate-plugins --max-async-wait-time 60 2>&1 | ForEach-Object { "$_" }
     $out | ForEach-Object { Write-Info $_ }
     if ($LASTEXITCODE -ne 0 -or ($out -match '^\s*Error:')) {
-        # Carry pac's own lines into the exception. Without them the throw is all
-        # the caller sees once the console has scrolled.
         $why = @($out | Where-Object { $_ -match '(?i)error|fail|unable|cannot|missing' }) -join "`n  "
         throw ("Import failed.`n  " + $why +
                "`n`nThe settings file is at $Settings - it is reusable, fix the cause and re-run.")
@@ -1303,13 +1260,9 @@ then run this again.
     Write-Ok 'import succeeded.'
 }
 
-# ==============================================================================
-# main
-# ==============================================================================
 try {
     Write-Stage 'Step 1 - Solution preparation'
 
-    # --- collect every input up front, so nothing prompts mid-run -------------
     if ($SolutionPath -and -not (Test-Path -LiteralPath $SolutionPath -PathType Leaf)) {
         throw "Not a file: $SolutionPath"
     }
@@ -1337,7 +1290,6 @@ try {
         $ResourceGroupName     = Read-RequiredValue  'Resource group name'                                  (Get-Fallback $ResourceGroupName     'ResourceGroupName')
         $Location              = Read-RequiredValue  'Azure region (e.g. East US)'                          (Get-Fallback $Location              'Location')
         $KeyVaultName          = Read-RequiredValue  'Key Vault name (globally unique)'                     (Get-Fallback $KeyVaultName          'KeyVaultName')
-        # The AllowedEnvironments tag is the ENVIRONMENT id, not the tenant id.
         if (-not $AllowedEnvironmentTag -and -not (Get-Fallback $AllowedEnvironmentTag 'AllowedEnvironmentTag') -and -not $EnvironmentId) {
             $EnvironmentId = Read-RequiredValue 'Power Platform environment GUID (for the AllowedEnvironments secret tag)' (Get-Fallback $EnvironmentId 'EnvironmentId')
         }
@@ -1348,8 +1300,6 @@ try {
         $FnoPassword           = Read-RequiredSecret 'F&O password'                                         $FnoPassword
     }
 
-    # The environment variables must point at the vault whether or not this run
-    # created it, so these are needed either way.
     if (-not $SkipFno) {
         if (-not $FnoUsernameSecretUri -or -not $FnoPasswordSecretUri) {
             $SubscriptionId    = Read-RequiredValue 'Azure subscription id' (Get-Fallback $SubscriptionId    'SubscriptionId')
@@ -1362,9 +1312,6 @@ try {
         if (-not $FnoPasswordSecretUri) {
             $FnoPasswordSecretUri = New-SecretReference -Subscription $SubscriptionId -ResourceGroup $ResourceGroupName -Vault $KeyVaultName -Secret $PasswordSecretName
         }
-        # Fail before unpacking anything if the references are malformed.
-        # Dataverse otherwise accepts the import and reports "This variable
-        # didn't save properly" with no clue which value was wrong.
         foreach ($v in @{ Username = $FnoUsernameSecretUri; Password = $FnoPasswordSecretUri }.GetEnumerator()) {
             if ($v.Value -notmatch $SecretRefPattern) {
                 throw "Fno $($v.Key) is not a valid Key Vault secret reference: $($v.Value)`n$SecretRefHint"
@@ -1385,9 +1332,6 @@ try {
         $ClientSecret = Read-RequiredSecret 'Graph app client secret'          $ClientSecret
     }
 
-    # 'connector=id' pairs; the connector name is normalised so both
-    # shared_sharepointonline and the full /providers/... form work. -File hands
-    # an array parameter through as one comma-joined string, so split it back.
     $Connection = @($Connection | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $pins = @{}
     foreach ($c in $Connection) {
@@ -1405,9 +1349,6 @@ try {
     $work = Join-Path ([IO.Path]::GetTempPath()) ('handover_sol_' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $work -Force | Out-Null
     try {
-        # ======================================================================
-        # 1.1  fetch
-        # ======================================================================
         Write-Stage '1.1  Download the solution package'
         if ($SolutionUrl) {
             $src = Join-Path $work 'solution.zip'
@@ -1425,9 +1366,6 @@ try {
             $OutFile = Join-Path (Get-Location).Path ([IO.Path]::GetFileNameWithoutExtension($src) + '_Changed.zip')
         }
 
-        # ======================================================================
-        # 1.2  Key Vault and secrets
-        # ======================================================================
         if ($SkipKeyVault) {
             Write-Stage '1.2  Key Vault (skipped)'
             Write-Info 'The vault and both secrets must already exist - the environment variables still point at them.'
@@ -1443,9 +1381,6 @@ try {
             finally { $plain = $null }
         }
 
-        # ======================================================================
-        # 1.3  retarget, point the environment variables at the vault, repack
-        # ======================================================================
         Write-Stage '1.3  Retarget values, point environment variables at the vault, repack'
         $graphToken = $null
         if ($ResolveLibraryId) {
@@ -1462,9 +1397,6 @@ try {
 
         if (-not (Test-Path -LiteralPath $OutFile)) { throw "Packing reported success but $OutFile is not there." }
 
-        # ======================================================================
-        # 1.4  connections, settings file, import
-        # ======================================================================
         Write-Stage '1.4  Create the Dataverse and SharePoint connections, then import'
         if (-not $SkipCreateSharePoint) {
             Write-Info 'SharePoint has no service principal option - a browser will open for one interactive sign-in.'
@@ -1484,9 +1416,6 @@ try {
         if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
-    # ==========================================================================
-    # gate
-    # ==========================================================================
     Write-Stage 'Gate - import succeeded'
     if ($SkipImport) {
         Write-Host '    Import skipped (-SkipImport). Settings file written, environment untouched.' -ForegroundColor Yellow

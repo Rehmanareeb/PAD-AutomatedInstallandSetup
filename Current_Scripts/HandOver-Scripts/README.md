@@ -194,6 +194,56 @@ design works around:
   reusable — pass `-SkipCreateSharePoint` with a `-Connection` pin on later runs.
 - **Everything else** is an ordinary delegated call off `az login`.
 
+## Running app-only
+
+Most of the pipeline works signed in as a service principal:
+
+```powershell
+az login --service-principal -u <appId> -p <secret> --tenant <tenantId>
+```
+```powershell
+pac auth create --applicationId <appId> --clientSecret <secret> --tenant <tenantId> --environment <orgUrl>
+```
+
+What that app needs:
+
+| Kind | Grant | Scope | For |
+|---|---|---|---|
+| Azure RBAC | `Contributor` | subscription | resource group, vault, `az provider register` (subscription-scoped) |
+| Azure RBAC | `Role Based Access Control Administrator` | the resource group | the four role assignments — Contributor cannot create them |
+| Azure RBAC | `Key Vault Secrets Officer` | the resource group | write the F&O secrets (the vault does not exist yet) |
+| Graph **application** | `Application.Read.All`, admin consent | tenant | `az ad sp show`, and the Copilot Studio / Dataverse SP lookups |
+| Dataverse | application user, **System Administrator** | the environment | solution import, `usagetype`, connection references, `accesscontrolpolicy`, publish |
+
+Register the provider once by hand and RG-scoped Contributor is enough — subscription
+Contributor is only there for `az provider register`.
+
+Pass `-EnvironmentId` when running app-only. Without it stage 1.4 looks the
+environment up through `api.powerapps.com`, which is the one avoidable delegated
+call in the pipeline.
+
+## Where app-only does not work
+
+Three steps refuse a service principal, and each one now fails **before** the
+call rather than several requests later:
+
+| Step | Why | What to do |
+|---|---|---|
+| First SharePoint connection (1.4) | `shared_sharepointonline` publishes no service principal parameter set | one human sign-in per environment. Afterwards `-SkipCreateSharePoint` with `-Connection shared_sharepointonline=<id>` |
+| Computer Use connection (3.3) | created with sharing disabled, so the connectivity service answers **code 10006** | sign in as a person, or `-Interactive` for a device code. Once per machine |
+| Agent authentication (4.4) | the Copilot gateway rejects a token whose `idtyp` is `app` | sign in as a person, or `-SkipManualAuth` and set it in the designer |
+
+Not verified either way: the **Dataverse connection** PUT in stage 1.4, and
+`pac copilot publish` under a service-principal profile. Both are left
+unguarded — try them app-only and see. If the connection PUT is refused, create
+it once by hand and pass `-SkipCreateDataverse -Connection shared_commondataserviceforapps=<id>`.
+
+`pac connection list` under a service-principal profile may not see connections
+owned by a person — which the SharePoint one will be. Pin it with `-Connection`
+rather than relying on the listing.
+
+So the realistic floor is **two browser sign-ins per environment**, not zero.
+
 ## `handover-state.json`
 
 Each stage writes the non-secret answers it collected — org URL, environment id,
@@ -245,6 +295,10 @@ Two scripts carry checks that need no tenant:
 ```powershell
 .\Prepare-Sol.ps1 -SelfTest    # pac output parsing, Key Vault secret references
 .\Share-Agents.ps1 -SelfTest   # the access-policy rules
+```
+
+```powershell
+.\Test-AppOnly.ps1             # service principal vs user branching, and that the three human-only steps are guarded
 ```
 
 ## Known limitations
