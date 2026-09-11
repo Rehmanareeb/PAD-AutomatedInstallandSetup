@@ -509,11 +509,24 @@ function Split-DeferredReferences {
       Some connection references cannot be bound at import time, because the
       connection they point at does not exist yet.
 
-      shared_computeroperator is the one this pipeline hits. The Computer Use
-      connection is created in stage 3.3, which needs a REGISTERED MACHINE,
-      which needs stage 2, which runs AFTER this import. Requiring it here is a
-      chicken-and-egg no fresh environment can satisfy, and the error it produced
-      told you to create a connection that cannot exist yet.
+      Two connectors in this solution qualify, for different reasons:
+
+        shared_computeroperator       the Computer Use connection is created in
+                                      stage 3.3, which needs a REGISTERED MACHINE,
+                                      which needs stage 2, which runs AFTER this
+                                      import. A chicken-and-egg no fresh
+                                      environment can satisfy.
+
+        shared_microsoftcopilotstudio an ORPHAN. customizations.xml declares the
+                                      connection reference 'Microsoft Copilot
+                                      Studio FinanceNewsIntelligenceAgent-0d2bd',
+                                      left over from an unrelated agent, and
+                                      NOTHING consumes it - no workflow, and no
+                                      entry in botcomponent_connectionreferenceset.
+                                      Binding it would mean signing a person in to
+                                      create a connection no component ever calls.
+                                      The real fix is to delete the reference from
+                                      the solution; until then it is dropped here.
 
       Dropping the entry is the fix, not blanking it - the same trap as the
       environment variables: pac rejects an empty value in this file, while an
@@ -1228,8 +1241,8 @@ function Set-SolutionConnections {
         [string] $AppId, [string] $Tenant, [string] $AppSecret,
         [string] $DataverseName, [string] $SharePointName, [int] $ConsentTimeout,
         [bool] $DoImport,
-        [string[]] $DeferConnector  = @('shared_computeroperator'),
-        [string[]] $ConsentConnector = @('shared_microsoftcopilotstudio')
+        [string[]] $DeferConnector   = @('shared_computeroperator', 'shared_microsoftcopilotstudio'),
+        [string[]] $ConsentConnector = @()
     )
 
     $pac = Resolve-Pac
@@ -1373,9 +1386,9 @@ function Set-SolutionConnections {
         <#
           Some connectors publish no service principal parameter set at all, so
           the connection has to be consented to by a person. shared_sharepointonline
-          is one; shared_microsoftcopilotstudio is another, and it is NOT created
-          by any later stage, so unlike shared_computeroperator it cannot simply
-          be deferred - without it the agent-to-agent action has nothing to call.
+          is the one this solution needs; -ConsentConnector adds any other that
+          must be created on demand when the bind loop finds none, and is empty by
+          default.
 
           What can be automated is everything around the sign-in: the shell, the
           consent link and the polling. The human part is one sign-in, usually one
