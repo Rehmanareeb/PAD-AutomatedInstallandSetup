@@ -282,6 +282,36 @@ function ConvertFrom-PacConnectionList {
     $out
 }
 
+function Split-DeferredReferences {
+    <#
+      Some connection references cannot be bound at import time, because the
+      connection they point at does not exist yet.
+
+      shared_computeroperator is the one this pipeline hits. The Computer Use
+      connection is created in step 3.3, which needs a REGISTERED MACHINE,
+      which needs step 2, which runs AFTER this import. Requiring it here is a
+      chicken-and-egg no fresh environment can satisfy, and the error it produced
+      told you to create a connection that cannot exist yet.
+
+      Dropping the entry is the fix, not blanking it - the same trap as the
+      environment variables: pac rejects an empty value in this file, while an
+      absent entry imports cleanly and leaves the reference unbound. Step 2
+      sub-steps 4.1-4.3 then create the reference, link it and repoint the
+      action, which is where that binding belongs.
+
+      SettingsObject is mutated: the deferred entries are removed from it, so the
+      file written afterwards does not mention them.
+    #>
+    param($SettingsObject, [string[]] $DeferConnector)
+
+    $refs     = @($SettingsObject.ConnectionReferences)
+    $deferred = @($refs | Where-Object { ($_.ConnectorId -replace '^.*/', '') -in    $DeferConnector })
+    $bind     = @($refs | Where-Object { ($_.ConnectorId -replace '^.*/', '') -notin $DeferConnector })
+
+    if ($deferred.Count) { $SettingsObject.ConnectionReferences = $bind }
+    @{ Bind = $bind; Deferred = $deferred }
+}
+
 function New-SecretReference {
     param([string] $Subscription, [string] $ResourceGroup, [string] $Vault, [string] $Secret)
     "/subscriptions/$Subscription/resourceGroups/$ResourceGroup/providers/Microsoft.KeyVault/vaults/$Vault/secrets/$Secret"
@@ -1055,7 +1085,8 @@ function Set-SolutionConnections {
         [hashtable] $Pins, [bool] $DoDataverse, [bool] $DoSharePoint,
         [string] $AppId, [string] $Tenant, [string] $AppSecret,
         [string] $DataverseName, [string] $SharePointName, [int] $ConsentTimeout,
-        [bool] $DoImport
+        [bool] $DoImport,
+        [string[]] $DeferConnector = @('shared_computeroperator')
     )
 
     $pac = Resolve-Pac
@@ -1077,6 +1108,27 @@ function Set-SolutionConnections {
         $settingsObj.EnvironmentVariables = @($vars | Where-Object { $_.Value })
         Write-Info ("dropped $($empty.Count) environment variable(s) with no value, keeping the solution's own: " +
                     ($empty.SchemaName -join ', '))
+    }
+
+    <#
+      Some connection references cannot be bound at import time because the
+      connection they point at does not exist yet.
+
+      shared_computeroperator is the one: the Computer Use connection is created
+      in stage 3.3, which needs a REGISTERED MACHINE, which needs stage 2, which
+      runs after this import. Demanding it here is a chicken-and-egg - the import
+      can never succeed on a fresh environment.
+
+      Dropping the entry is the right move, not blanking it: pac rejects an empty
+      value in this file, while an absent entry imports cleanly and leaves the
+      reference unbound. Stage 2 steps 4.1-4.3 then create the reference, link it
+      and repoint the action, which is where that binding belongs anyway.
+    #>
+    $split = Split-DeferredReferences -SettingsObject $settingsObj -DeferConnector $DeferConnector
+    $refs  = @($split.Bind)
+    if ($split.Deferred.Count) {
+        Write-Info ("deferred $($split.Deferred.Count) connection reference(s) to step 2, left unbound by the import: " +
+                    (@($split.Deferred | ForEach-Object { $_.LogicalName }) -join ', '))
     }
 
     $paHeaders = $null
@@ -1228,6 +1280,11 @@ human to consent:
                  make.powerapps.com -> Connections -> New connection
 
 then run this again.
+
+If this connector's connection is created by a LATER step - as
+shared_computeroperator is, in step 3.3 - it cannot exist yet and does not
+belong here at all. Add it to Split-DeferredReferences' -DeferConnector list so
+the import leaves the reference unbound.
 "@
         }
 
