@@ -45,14 +45,30 @@ foreach ($file in 'Prepare-Sol.ps1', 'Run-HandOver.ps1') {
     Check "$file no references at all"           (@($r4.Bind).Count -eq 0 -and @($r4.Deferred).Count -eq 0) 'empty in, empty out'
 }
 
-$defaults = @()
-foreach ($file in 'Prepare-Sol.ps1', 'Run-HandOver.ps1') {
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile("$dir\$file", [ref]$null, [ref]$null)
+function Get-ParamDefault { param([string] $File, [string] $Param)
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile("$dir\$File", [ref]$null, [ref]$null)
     $p = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ParameterAst] -and
-                        $args[0].Name.VariablePath.UserPath -eq 'DeferConnector' }, $true)
-    $defaults += @($p | ForEach-Object { $_.DefaultValue.Extent.Text })
+                        $args[0].Name.VariablePath.UserPath -eq $Param }, $true)
+    @($p | ForEach-Object { $_.DefaultValue.Extent.Text }) -join ' | '
 }
-Check 'both files default to shared_computeroperator' (@($defaults | Where-Object { $_ -match 'shared_computeroperator' }).Count -eq 2) ($defaults -join ' | ')
+
+foreach ($file in 'Prepare-Sol.ps1', 'Run-HandOver.ps1') {
+    $defer   = Get-ParamDefault $file 'DeferConnector'
+    $consent = Get-ParamDefault $file 'ConsentConnector'
+
+    Check "$file defers shared_computeroperator"   ($defer   -match 'shared_computeroperator')      $defer
+    Check "$file consents microsoftcopilotstudio"  ($consent -match 'shared_microsoftcopilotstudio') $consent
+    Check "$file does NOT auto-consent SharePoint" ($consent -notmatch 'shared_sharepointonline')    $consent
+    Check "$file does NOT consent computeroperator" ($consent -notmatch 'shared_computeroperator')   $consent
+
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile("$dir\$file", [ref]$null, [ref]$null)
+    $defs  = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                              $args[0].Name -eq 'New-ConsentedConnection' }, $true))
+    $calls = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+                              $args[0].GetCommandName() -eq 'New-ConsentedConnection' }, $true))
+    Check "$file one consent helper, used twice" ($defs.Count -eq 1 -and $calls.Count -eq 2) "def=$($defs.Count) calls=$($calls.Count)"
+    Check "$file helper defined before first use" ($defs.Count -eq 1 -and $calls.Count -and $defs[0].Extent.StartLineNumber -lt ($calls | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)[0]) "def L$($defs[0].Extent.StartLineNumber)"
+}
 
 if ($fail) { Write-Host "`n$fail check(s) failed" -ForegroundColor Red; exit 1 }
 Write-Host "`nall passed - the Computer Use reference is dropped from the settings file, not blanked, and stage 2 binds it" -ForegroundColor Green

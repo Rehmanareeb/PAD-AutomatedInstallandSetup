@@ -1228,7 +1228,8 @@ function Set-SolutionConnections {
         [string] $AppId, [string] $Tenant, [string] $AppSecret,
         [string] $DataverseName, [string] $SharePointName, [int] $ConsentTimeout,
         [bool] $DoImport,
-        [string[]] $DeferConnector = @('shared_computeroperator')
+        [string[]] $DeferConnector  = @('shared_computeroperator'),
+        [string[]] $ConsentConnector = @('shared_microsoftcopilotstudio')
     )
 
     $pac = Resolve-Pac
@@ -1361,57 +1362,81 @@ function Set-SolutionConnections {
         $Pins['shared_commondataserviceforapps'] = $newId
     }
 
-    if ($DoSharePoint) {
-        Write-Info 'Creating a SharePoint connection...'
-        # SharePoint has no service principal option, so the connection has to be
-        # consented to by a person. What can be automated is everything around
-        # that: the shell, the consent link and the polling. The human part is
-        # one sign-in, usually one click.
-        Assert-AzUserSession 'Creating the first SharePoint connection in an environment'
-        $newSpId = 'shared-sharepointonl-' + [Guid]::NewGuid().ToString()
-        $spUrl   = 'https://api.powerapps.com/providers/Microsoft.PowerApps/apis/' +
-                   "shared_sharepointonline/connections/${newSpId}?api-version=2016-11-01" + $envFilter
+    function New-ConsentedConnection {
+        <#
+          Some connectors publish no service principal parameter set at all, so
+          the connection has to be consented to by a person. shared_sharepointonline
+          is one; shared_microsoftcopilotstudio is another, and it is NOT created
+          by any later stage, so unlike shared_computeroperator it cannot simply
+          be deferred - without it the agent-to-agent action has nothing to call.
 
-        $spBody = @{ properties = @{
-            displayName          = $SharePointName
+          What can be automated is everything around the sign-in: the shell, the
+          consent link and the polling. The human part is one sign-in, usually one
+          click.
+
+          Reads $paHeaders, $envFilter, $EnvId and $ConsentTimeout from the
+          enclosing function. Returns the new connection id.
+        #>
+        param(
+            [Parameter(Mandatory)][string] $Connector,
+            [Parameter(Mandatory)][string] $Name,
+            [string] $IdPrefix
+        )
+
+        Assert-AzUserSession "Creating the first '$Connector' connection in an environment"
+        $newId = if ($IdPrefix) { $IdPrefix + [Guid]::NewGuid().ToString() }
+                 else           { (New-Guid).Guid.Replace('-', '') }
+        $url = 'https://api.powerapps.com/providers/Microsoft.PowerApps/apis/' +
+               "$Connector/connections/${newId}?api-version=2016-11-01" + $envFilter
+
+        $body = @{ properties = @{
+            displayName          = $Name
             environment          = @{ id = "/providers/Microsoft.PowerApps/environments/$EnvId"; name = $EnvId }
             connectionParameters = @{}
         } } | ConvertTo-Json -Depth 10
 
-        Invoke-RestMethod -Method Put -Uri $spUrl -Headers $paHeaders -ContentType 'application/json' -Body $spBody | Out-Null
-        Write-Info "created $newSpId unauthenticated, asking for a consent link"
+        Invoke-RestMethod -Method Put -Uri $url -Headers $paHeaders -ContentType 'application/json' -Body $body | Out-Null
+        Write-Info "created $newId unauthenticated, asking for a consent link"
 
-        # Signing in at the consent link is what authenticates the connection;
-        # the portal's follow-up confirmConsentCode call is bookkeeping, not a
-        # requirement. So there is nothing to catch - ask the service, and poll.
+        <#
+          Signing in at the consent link is what authenticates the connection;
+          the portal's follow-up confirmConsentCode call is bookkeeping, not a
+          requirement. So there is nothing to catch - ask the service, and poll.
+        #>
         $redirect = 'https://make.powerapps.com/connection/oauth/redirect?oauthPopupId=' + [Guid]::NewGuid()
         $linkUrl  = 'https://api.powerapps.com/providers/Microsoft.PowerApps/apis/' +
-                    "shared_sharepointonline/connections/$newSpId/getConsentLink?api-version=2016-11-01" + $envFilter
+                    "$Connector/connections/$newId/getConsentLink?api-version=2016-11-01" + $envFilter
         $link = (Invoke-RestMethod -Method Post -Uri $linkUrl -Headers $paHeaders -ContentType 'application/json' `
                     -Body (@{ redirectUrl = $redirect } | ConvertTo-Json)).consentLink
-        if (-not $link) { throw 'The consent service returned no link.' }
+        if (-not $link) { throw "The consent service returned no link for $Connector." }
 
         Write-Host ''
-        Write-Host '    A browser window is opening. Sign in as the account the flows should run as.' -ForegroundColor Yellow
+        Write-Host "    A browser window is opening for '$Connector'. Sign in as the account the agent should run as." -ForegroundColor Yellow
         Write-Host "    If it does not open, paste this in yourself:`n    $link"
         Start-Process $link
 
         $deadline = (Get-Date).AddSeconds($ConsentTimeout)
         do {
             Start-Sleep -Seconds 3
-            $spStatus = (Invoke-RestMethod -Uri $spUrl -Headers $paHeaders).properties.statuses | Select-Object -First 1
-            Write-Info "waiting for sign-in... $($spStatus.status)"
-        } while ($spStatus.status -ne 'Connected' -and (Get-Date) -lt $deadline)
+            $status = (Invoke-RestMethod -Uri $url -Headers $paHeaders).properties.statuses | Select-Object -First 1
+            Write-Info "waiting for sign-in... $($status.status)"
+        } while ($status.status -ne 'Connected' -and (Get-Date) -lt $deadline)
 
-        if ($spStatus.status -ne 'Connected') {
-            throw ("Still '$($spStatus.status)' after $ConsentTimeout seconds. " +
-                   "Connection $newSpId is left behind - delete it in make.powerapps.com, or re-run with " +
-                   "-SkipCreateSharePoint -Connection shared_sharepointonline=$newSpId once you have signed it in there.")
+        if ($status.status -ne 'Connected') {
+            throw ("Still '$($status.status)' after $ConsentTimeout seconds. " +
+                   "Connection $newId is left behind - delete it in make.powerapps.com, or sign it in there " +
+                   "and re-run with -Connection $Connector=$newId.")
         }
 
-        $spMade = Invoke-RestMethod -Uri $spUrl -Headers $paHeaders
-        Write-Ok "created $newSpId ($($spMade.properties.displayName)) Connected as $($spMade.properties.authenticatedUser.name)"
-        $Pins['shared_sharepointonline'] = $newSpId
+        $made = Invoke-RestMethod -Uri $url -Headers $paHeaders
+        Write-Ok "created $newId ($($made.properties.displayName)) Connected as $($made.properties.authenticatedUser.name)"
+        $newId
+    }
+
+    if ($DoSharePoint) {
+        Write-Info 'Creating a SharePoint connection...'
+        $Pins['shared_sharepointonline'] = New-ConsentedConnection -Connector 'shared_sharepointonline' `
+            -Name $SharePointName -IdPrefix 'shared-sharepointonl-'
     }
 
     # --- what exists in the target -------------------------------------------
@@ -1434,6 +1459,22 @@ function Set-SolutionConnections {
         }
 
         $candidates = @($conns | Where-Object { $_.Connector -eq $connector -and $_.Status -eq 'Connected' })
+
+        <#
+          A connector that only a person can authenticate, with nothing in the
+          environment yet. Creating it here rather than throwing is the whole
+          point: this is exactly the moment we know it is needed and know it is
+          missing. SharePoint is deliberately NOT in this list - it has its own
+          -SkipCreateSharePoint switch, and honouring that matters more.
+        #>
+        if ($candidates.Count -eq 0 -and $connector -in $ConsentConnector) {
+            Write-Info "$connector has no connection here, and only a person can create one."
+            $r.ConnectionId  = New-ConsentedConnection -Connector $connector `
+                                   -Name (($connector -replace '^shared_', '') + '-oauth')
+            $Pins[$connector] = $r.ConnectionId
+            Write-Info "$connector -> $($r.ConnectionId)  (consented just now)"
+            continue
+        }
 
         if ($candidates.Count -eq 0) {
             throw @"

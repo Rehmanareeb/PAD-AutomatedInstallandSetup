@@ -57,9 +57,9 @@ foreach ($file in 'Prepare-Sol.ps1', 'Run-HandOver.ps1', 'Machine-and-Cua.ps1') 
 }
 
 $expect = @{
-    'Prepare-Sol.ps1'     = @('Creating the first SharePoint connection in an environment')
+    'Prepare-Sol.ps1'     = @('connection in an environment')
     'Machine-and-Cua.ps1' = @('Creating the Computer Use connection', 'Step 4.4, setting the agent authentication to Custom Entra')
-    'Run-HandOver.ps1'    = @('Creating the first SharePoint connection in an environment', 'Creating the Computer Use connection', 'Step 4.4, setting the agent authentication to Custom Entra')
+    'Run-HandOver.ps1'    = @('connection in an environment', 'Creating the Computer Use connection', 'Step 4.4, setting the agent authentication to Custom Entra')
 }
 foreach ($file in $expect.Keys) {
     $ast  = [System.Management.Automation.Language.Parser]::ParseFile("$dir\$file", [ref]$null, [ref]$null)
