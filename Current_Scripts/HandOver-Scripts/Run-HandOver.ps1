@@ -398,6 +398,21 @@ Pass -EnvironmentId instead, or -AllowedEnvironmentTag with the environment id
 "@
         }
     }
+
+    if ($EnvironmentId -and $ids -notcontains $EnvironmentId) {
+        throw @"
+The AllowedEnvironments tag ($($ids -join ',')) does not list the environment
+being deployed to ($EnvironmentId), so that environment could not resolve the
+secret at run time.
+
+A stale value cached in handover-state.json is the usual cause: the tag is saved
+there by an earlier run against a different environment, and the cached value
+wins over an -EnvironmentId passed on the command line. Delete the
+AllowedEnvironmentTag entry from that file, or pass -AllowedEnvironmentTag with
+a list that includes $EnvironmentId.
+"@
+    }
+
     $ids -join ','
 }
 
@@ -3733,6 +3748,7 @@ try {
         Write-Host "      $resume" -ForegroundColor Yellow
         Write-Host '  Answers already given are cached in handover-state.json, so you will not be asked again.' -ForegroundColor Yellow
         Write-Host ''
+        $script:Reported = $true
         throw
     }
 
@@ -3740,5 +3756,22 @@ try {
     Write-Info 'All requested stages finished.'
 }
 catch {
+    <#
+      Only the stage runner above has already printed. Anything thrown earlier -
+      the whole collection phase - reached this catch, and `exit 1` on its own
+      swallowed it: the script simply stopped after a prompt with no message at
+      all. Print unless the inner catch already did.
+    #>
+    if (-not $script:Reported) {
+        Write-Host ''
+        Write-Host ('=' * 72) -ForegroundColor Red
+        Write-Host '  FAILED before any stage ran' -ForegroundColor Red
+        Write-Host ('=' * 72) -ForegroundColor Red
+        Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host ''
+        Write-Host "  Nothing was changed. Cached answers live in $StatePath -" -ForegroundColor Yellow
+        Write-Host '  delete that file to be asked everything again.' -ForegroundColor Yellow
+        Write-Host ''
+    }
     exit 1
 }

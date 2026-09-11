@@ -325,6 +325,21 @@ Pass -EnvironmentId instead, or -AllowedEnvironmentTag with the environment id
 "@
         }
     }
+
+    if ($EnvironmentId -and $ids -notcontains $EnvironmentId) {
+        throw @"
+The AllowedEnvironments tag ($($ids -join ',')) does not list the environment
+being deployed to ($EnvironmentId), so that environment could not resolve the
+secret at run time.
+
+A stale value cached in handover-state.json is the usual cause: the tag is saved
+there by an earlier run against a different environment, and the cached value
+wins over an -EnvironmentId passed on the command line. Delete the
+AllowedEnvironmentTag entry from that file, or pass -AllowedEnvironmentTag with
+a list that includes $EnvironmentId.
+"@
+    }
+
     $ids -join ','
 }
 
