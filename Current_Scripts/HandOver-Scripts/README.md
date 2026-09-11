@@ -169,7 +169,7 @@ Every script takes `-Help`, and `Get-Help .\Prepare-Sol.ps1 -Full` works.
 
 | Tool | Needed by | Note |
 |---|---|---|
-| `az login` | stages 1, 2, 3 | Key Vault, connections, Dataverse calls |
+| `az login` | stages 1, 2, 3 | Key Vault, connections, Dataverse calls. **`Run-HandOver.ps1` does this itself** — it signs in to `-TenantId` if there is no session or the session is on another tenant, reuses a good one (service principal included), and proves `-SubscriptionId` is visible before anything is created. The three stage scripts still expect you to have signed in. |
 | `pac auth` profile | stages 1, 3 | unpack, pack, import, publish |
 | Administrator | stage 2 | machine registration only |
 | Power Automate machine-registration app | stage 2 | Flow Service permissions with admin consent, plus an application user in the target environment |

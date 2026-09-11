@@ -309,6 +309,73 @@ function Get-AzSessionKind {
     $kind
 }
 
+function Connect-AzCli {
+    <#
+      Signs the Azure CLI in, rather than assuming somebody did it first.
+
+      A session already on the right tenant is left alone - including a service
+      principal one, so `az login --service-principal` before running this script
+      still works and is not replaced by an interactive prompt.
+
+      The subscription is then proved visible BEFORE anything is created.
+      `az account set` answers "The subscription of '<id>' doesn't exist in cloud
+      'AzureCloud'" for a subscription in another tenant, for one the signed-in
+      account holds no role on, and for one that does not exist - three very
+      different fixes behind one message - so the list is printed instead.
+    #>
+    param([string] $Tenant, [string] $Subscription)
+
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+        throw 'Azure CLI (az) not found. Install it from https://aka.ms/azure-cli.'
+    }
+
+    $current = ''
+    try { $current = (& az account show --query tenantId --output tsv --only-show-errors 2>$null | Out-String).Trim() }
+    catch { $current = '' }
+    if ($LASTEXITCODE -ne 0) { $current = '' }
+
+    if (-not $current -or ($Tenant -and $current -ne $Tenant)) {
+        if ($current) { Write-Info "az is on tenant $current, signing in to $Tenant" }
+        else          { Write-Info 'no az session, signing in' }
+
+        if ($Tenant) { & az login --tenant $Tenant --only-show-errors | Out-Null }
+        else         { & az login --only-show-errors | Out-Null }
+        if ($LASTEXITCODE -ne 0) { throw 'az login failed.' }
+
+        $current = (& az account show --query tenantId --output tsv --only-show-errors | Out-String).Trim()
+        if ($Tenant -and $current -ne $Tenant) {
+            throw "az signed in to tenant '$current', expected '$Tenant'."
+        }
+    }
+
+    $kind = Get-AzSessionKind
+    $who  = Invoke-Az @('account', 'show', '--query', 'user.name', '--output', 'tsv') 'Could not read the Azure account.'
+    Write-Ok "az signed in as $who [$kind] on tenant $current"
+
+    if (-not $Subscription) { return }
+
+    $found = Invoke-Az @('account', 'list', '--query', "[?id=='$Subscription'].id | [0]", '--output', 'tsv') `
+        'Could not list Azure subscriptions.' -AllowFailure
+    if (-not $found) {
+        $visible = Invoke-Az @('account', 'list', '--query', '[].[id,name]', '--output', 'tsv') `
+            'Could not list Azure subscriptions.' -AllowFailure
+        throw @"
+Subscription $Subscription is not visible to $who on tenant $current.
+
+That one message covers three different causes:
+  - the subscription is in another tenant   check: az account list --all --output table
+  - this account holds no role on it        someone with Owner must assign Contributor
+  - the id is wrong
+
+Visible to this account right now:
+$(if ($visible) { $visible } else { '  (none - signed in with --allow-no-subscriptions?)' })
+"@
+    }
+
+    Invoke-Az @('account', 'set', '--subscription', $Subscription) "Could not select subscription $Subscription." | Out-Null
+    Write-Ok "subscription $Subscription selected"
+}
+
 function Get-AzCallerIdentity {
     <#
       The object id AND principal type of whoever az is signed in as. Both are
@@ -3702,6 +3769,15 @@ try {
         Write-Banner 'WhatIfStages - stopping without running anything'
         return
     }
+
+    <#
+      Before anything is downloaded or created. Every stage needs az, and the
+      subscription is only worth proving when this run will actually touch the
+      vault.
+    #>
+    Write-Banner 'Azure sign-in'
+    Connect-AzCli -Tenant $TenantId `
+                  -Subscription $(if ($runPrepare -and -not $SkipKeyVault) { $SubscriptionId })
 
     # --- run ------------------------------------------------------------------
     $stage = $null
