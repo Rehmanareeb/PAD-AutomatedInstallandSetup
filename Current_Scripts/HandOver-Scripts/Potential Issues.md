@@ -183,6 +183,55 @@ into the solution is used.
 
 *How we handle it:* blank-valued entries are dropped before the file is written.
 
+### 🔴 `pac solution import --settings-file` can leave a connection reference unbound
+
+The settings file is the supported way to bind connection references during an
+import. It is not reliable: a correct file can be handed to the import, the
+import reports success, and the reference lands with `connectionid` empty.
+
+*Measured end to end:*
+
+- The settings file was right - correct logical name, correct connection id, and
+  the SharePoint entry correctly dropped by Dataverse-only mode.
+- The import reported success.
+- The `connectionreferences` row came out with **no connectionid**.
+- One PATCH setting `connectionid` fixed it, and the agent tool rendered.
+
+*Why it is invisible:* the symptom is not an error. Copilot Studio expands an
+agent tool's **Row Item** input by calling
+
+    POST .../api/connectorintellisense/inputSchema
+    { "connectionReference": "<logical name>", "operationId": "...",
+      "input": { "organization": "...", "entityName": "..." }, "parameter": "item" }
+
+which identifies the connection **by reference logical name, not by id**. The
+gateway resolves the name to the row, reads `connectionid`, and calls the
+connector. An unbound row means there is nothing to call, so the schema comes
+back empty and the input silently fails to expand.
+
+*Four things this is NOT, each disproved by measurement:*
+
+- not the connection's provenance - a script-created and a portal-created
+  connection in the same environment are identical apart from a timestamp and a
+  URL containing their own id, and the tool renders with either
+- not a service principal limitation - the tool renders with the service
+  principal connection the script created
+- not the package - the failing and working packages have identical `inputs:`
+  blocks, the same eleven `item.*` entries
+- not a missing table - the table and all 25 of its columns exist in the target
+
+*How we handle it:* after the import, PATCH every reference to the connection id
+the settings file specified, then read the rows back and fail if any is unbound
+or bound to something else. That is the same single call make.powerapps.com makes
+when a connection is switched by hand - confirmed from a HAR of the portal doing
+it, which turned out to be one PATCH and nothing else.
+
+*Still open:* why the import ignores the file. Nothing in pac's output suggests
+anything went wrong, so the re-assert is a workaround rather than a fix.
+
+**`Run-HandOver.ps1` has the same exposure** - it imports with `--settings-file`
+and does not re-assert afterwards. The post-import PATCH belongs there too.
+
 ### 🟡 `pac connection list` is parsed by column position
 
 Output is a fixed-width table with no machine-readable option. We take token 0 as
